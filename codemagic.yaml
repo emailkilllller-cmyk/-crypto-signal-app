@@ -8,6 +8,9 @@ workflows:
       flutter: stable
 
     scripts:
+      - name: Generate Android project
+        script: flutter create --platforms=android .
+
       - name: Get Flutter packages
         script: flutter pub get
 
