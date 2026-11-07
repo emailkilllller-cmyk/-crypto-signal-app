@@ -106,7 +106,7 @@ class Indicators {
     final m=macdHist(c); if(m>0)score++;else if(m<0)score--; return score;
   }
   static List<double> features(List<Candle> cs){final c=cs.map((e)=>e.close).toList(); final price=c.last; final e9=ema(c,9),e21=ema(c,21),r=rsi(c,14),a=atr(cs,14); final ret3=(price/c[c.length-4]-1)*100, ret10=(price/c[c.length-11]-1)*100; final vol=cs.skip(cs.length>30?cs.length-30:0).map((x)=>x.volume).toList(); final avg=vol.reduce((x,y)=>x+y)/vol.length; final sd=math.sqrt(vol.map((x)=>(x-avg)*(x-avg)).reduce((x,y)=>x+y)/vol.length); final vz=sd==0?0:(vol.last-avg)/sd;
-    return [(e9-e21)/price*100,(r-50)/50,(macdHist(c)/price)*100,ret3,ret10,(a/price)*100,vz];}
+    return [(e9-e21)/price*100,(r-50)/50,(macdHist(c)/price)*100,ret3,ret10,(a/price)*100,vz.toDouble()];
   static Signal analyze(String symbol,String tf,List<Candle> cs,{double? mlProbability}){final c=cs.map((x)=>x.close).toList(); final price=c.last,e9=ema(c,9),e21=ema(c,21),r=rsi(c,14),a=atr(cs,14); final f=features(cs); int score=0; if(e9>e21)score+=2;else score-=2;if(price>e9)score++;else score--;if(r>52&&r<70)score++;if(r<48&&r>30)score--; if(f[3]>0)score++;else score--;if(f[4]>0)score++;else score--;
     String side=score>=4?'LONG':score<=-4?'SHORT':'WAIT'; if(mlProbability!=null){side=mlProbability>=0.58?'LONG':mlProbability<=0.42?'SHORT':'WAIT';} final risk=math.max(a*1.6,price*0.003).toDouble(); final sl=side=='LONG'?price-risk:side=='SHORT'?price+risk:price; final tp1=side=='LONG'?price+risk*1.5:side=='SHORT'?price-risk*1.5:price; final tp2=side=='LONG'?price+risk*2.5:side=='SHORT'?price-risk*2.5:price;
     // Probability is an indicator score proxy, not a calibrated ML prediction.
