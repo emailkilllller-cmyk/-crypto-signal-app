@@ -1,1 +1,8 @@
-
+{
+  "status": "untrained",
+  "model": "logistic_regression",
+  "features": ["ema_gap_pct", "rsi_centered", "macd_hist_pct", "return_3_pct", "return_10_pct", "atr_pct", "volume_z"],
+  "bias": 0.0,
+  "weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "note": "Placeholder only. Train with tools/train_model.py before treating ML probability as calibrated."
+}
