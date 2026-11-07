@@ -1,8 +1,35 @@
 {
-  "status": "untrained",
+  "status": "trained",
   "model": "logistic_regression",
-  "features": ["ema_gap_pct", "rsi_centered", "macd_hist_pct", "return_3_pct", "return_10_pct", "atr_pct", "volume_z"],
-  "bias": 0.0,
-  "weights": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-  "note": "Placeholder only. Train with tools/train_model.py before treating ML probability as calibrated."
+  "features": [
+    "ema_gap_pct",
+    "rsi_centered",
+    "macd_hist_pct",
+    "return_3_pct",
+    "return_10_pct",
+    "atr_pct",
+    "volume_zscore"
+  ],
+  "bias": 0.4464300994926293,
+  "weights": [
+    -0.3421239226545779,
+    0.2466413894503792,
+    1.1150135489049176,
+    -0.07971851849688874,
+    -0.10332237518171608,
+    -0.8852035476065168,
+    -0.06900454137984656
+  ],
+  "training": {
+    "test_rows": 215,
+    "accuracy": 0.6744186046511628,
+    "balanced_accuracy": 0.6744588744588744,
+    "auc": 0.6997402597402598,
+    "train_rows": 858,
+    "symbol": "BTCUSDT",
+    "interval": "1h",
+    "horizon_candles": 10,
+    "label_threshold_pct": 0.25
+  },
+  "warning": "Historical research model; not a guarantee of future performance."
 }
