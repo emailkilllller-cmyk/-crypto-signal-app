@@ -1,4 +1,3 @@
-
 workflows:
   android-workflow:
     name: Crypto Signal Android
@@ -9,8 +8,44 @@ workflows:
       flutter: stable
 
     scripts:
+      - name: Add Dart SDK constraint before project generation
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('pubspec.yaml')
+          s = p.read_text()
+          constraint = "sdk: '>=3.13.0 <4.0.0'"
+
+          if re.search(r'(?m)^environment:\s*$', s):
+              if re.search(r'(?m)^\s+sdk:\s*', s):
+                  s = re.sub(r'(?m)^\s+sdk:\s*.*$', '  ' + constraint, s, count=1)
+              else:
+                  s = re.sub(r'(?m)^environment:\s*$', 'environment:\n  ' + constraint, s, count=1)
+          else:
+              s += '\n\nenvironment:\n  ' + constraint + '\n'
+
+          p.write_text(s)
+          print('Updated pubspec.yaml SDK constraint: ' + constraint)
+          PY
+
       - name: Generate Android project
         script: flutter create --platforms=android .
+
+      - name: Add Internet permission
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          permission = '<uses-permission android:name="android.permission.INTERNET" />'
+          if permission not in s:
+              s = s.replace('<manifest', '<manifest', 1)
+              s = s.replace('>', '>\n    ' + permission, 1)
+              p.write_text(s)
+          print('Internet permission checked')
+          PY
 
       - name: Enable Android desugaring
         script: |
@@ -18,35 +53,24 @@ workflows:
           from pathlib import Path
           import re
 
-          groovy = Path("android/app/build.gradle")
-          kotlin = Path("android/app/build.gradle.kts")
-
-          if groovy.exists():
-              p = groovy
-              flag = "coreLibraryDesugaringEnabled true"
-              dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
-          elif kotlin.exists():
-              p = kotlin
-              flag = "isCoreLibraryDesugaringEnabled = true"
-              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+          p = Path('android/app/build.gradle.kts')
+          if p.exists():
+              s = p.read_text()
+              if 'isCoreLibraryDesugaringEnabled = true' not in s:
+                  s = re.sub(r'compileOptions\s*\{', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', s, count=1)
+              if 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")' not in s:
+                  s = re.sub(r'dependencies\s*\{', 'dependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")', s, count=1)
+              p.write_text(s)
           else:
-              raise Exception("Android app Gradle file not found")
-
-          s = p.read_text()
-
-          if flag not in s:
-              s, n = re.subn(r'(compileOptions\s*\{)', r'\1\n        ' + flag, s, count=1)
-              if n == 0:
-                  raise Exception("compileOptions block not found")
-
-          if dep not in s:
-              if re.search(r'\bdependencies\s*\{', s):
-                  s = re.sub(r'(dependencies\s*\{)', r'\1\n    ' + dep, s, count=1)
-              else:
-                  s += "\ndependencies {\n    " + dep + "\n}\n"
-
-          p.write_text(s)
-          print("Desugaring enabled in", p)
+              p = Path('android/app/build.gradle')
+              if p.exists():
+                  s = p.read_text()
+                  if 'coreLibraryDesugaringEnabled true' not in s:
+                      s = re.sub(r'compileOptions\s*\{', 'compileOptions {\n        coreLibraryDesugaringEnabled true', s, count=1)
+                  if 'desugar_jdk_libs:2.1.4' not in s:
+                      s = re.sub(r'dependencies\s*\{', 'dependencies {\n    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.4"', s, count=1)
+                  p.write_text(s)
+          print('Desugaring configured')
           PY
 
       - name: Get Flutter packages
@@ -56,5 +80,4 @@ workflows:
         script: flutter build apk --release
 
     artifacts:
-      - build/app/outputs/flutter-apk/*.apk
-      
+      - build/app/outputs/flutter-apk/app-release.apk
