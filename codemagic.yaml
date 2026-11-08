@@ -1,3 +1,4 @@
+
 workflows:
   android-workflow:
     name: Crypto Signal Android
@@ -11,6 +12,43 @@ workflows:
       - name: Generate Android project
         script: flutter create --platforms=android .
 
+      - name: Enable Android desugaring
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          groovy = Path("android/app/build.gradle")
+          kotlin = Path("android/app/build.gradle.kts")
+
+          if groovy.exists():
+              p = groovy
+              flag = "coreLibraryDesugaringEnabled true"
+              dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
+          elif kotlin.exists():
+              p = kotlin
+              flag = "isCoreLibraryDesugaringEnabled = true"
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+          else:
+              raise Exception("Android app Gradle file not found")
+
+          s = p.read_text()
+
+          if flag not in s:
+              s, n = re.subn(r'(compileOptions\s*\{)', r'\1\n        ' + flag, s, count=1)
+              if n == 0:
+                  raise Exception("compileOptions block not found")
+
+          if dep not in s:
+              if re.search(r'\bdependencies\s*\{', s):
+                  s = re.sub(r'(dependencies\s*\{)', r'\1\n    ' + dep, s, count=1)
+              else:
+                  s += "\ndependencies {\n    " + dep + "\n}\n"
+
+          p.write_text(s)
+          print("Desugaring enabled in", p)
+          PY
+
       - name: Get Flutter packages
         script: flutter pub get
 
@@ -19,6 +57,4 @@ workflows:
 
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
-
-
       
