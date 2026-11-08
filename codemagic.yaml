@@ -41,8 +41,12 @@ workflows:
           s = p.read_text()
           permission = '<uses-permission android:name="android.permission.INTERNET" />'
           if permission not in s:
-              s = s.replace('<manifest', '<manifest', 1)
-              s = s.replace('>', '>\n    ' + permission, 1)
+              # Insert after the opening manifest tag, not the XML declaration.
+              import re
+              m = re.search(r'<manifest\b[^>]*>', s)
+              if not m:
+                  raise SystemExit('ERROR: manifest opening tag not found')
+              s = s[:m.end()] + '\n    ' + permission + s[m.end():]
               p.write_text(s)
           print('Internet permission checked')
           PY
@@ -82,19 +86,19 @@ workflows:
 
           if 'compileOptions' not in s:
               # Insert into android block immediately after its opening brace.
-              m = re.search(r'(?m)^android\\s*\\{', s)
+              m = re.search(r'(?m)^android\s*\{', s)
               if not m:
                   raise SystemExit('ERROR: android { } block not found')
               s = s[:m.end()] + '\\n    ' + compile_block + s[m.end():]
           elif flag not in s:
               # Existing compileOptions block: insert the desugaring flag.
-              m = re.search(r'compileOptions\\s*\\{', s)
+              m = re.search(r'compileOptions\s*\{', s)
               if not m:
                   raise SystemExit('ERROR: compileOptions block parsing failed')
               s = s[:m.end()] + '\\n        ' + flag + s[m.end():]
 
           if 'desugar_jdk_libs' not in s:
-              m = re.search(r'(?m)^dependencies\\s*\\{', s)
+              m = re.search(r'(?m)^dependencies\s*\{', s)
               if m:
                   s = s[:m.end()] + '\\n    ' + dep + s[m.end():]
               else:
