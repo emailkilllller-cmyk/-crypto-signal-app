@@ -155,12 +155,61 @@ class _HomePageState extends State<HomePage> {
     } if(changed)_save();
   }
   void _openPaper(){final s=current;if(s==null||s.side=='WAIT')return;final riskMoney=paperBalance*riskPercent/100;final distance=(s.entry-s.sl).abs();if(distance<=0)return;final qty=math.min(riskMoney/distance,(paperBalance*maxLeverage)/s.entry).toDouble();final t=PaperTrade(id:DateTime.now().microsecondsSinceEpoch.toString(),symbol:s.symbol,side:s.side,status:'OPEN',opened:DateTime.now(),entry:s.entry,sl:s.sl,tp1:s.tp1,qty:qty,pnl:0);setState(()=>trades.insert(0,t));_save();ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ مجازی ثبت شد؛ سفارش واقعی ارسال نمی‌شود.')));}
-  Future<void> _refreshPaper() async {final open=trades.where((x)=>x.status=='OPEN').toList();if(open.isEmpty)return;for(final t in open){try{final c=await MarketApi.candles(t.symbol,'5m',limit:2);final p=c.last.close;final hitSl=t.side=='LONG'?p<=t.sl:p>=t.sl;final hitTp=t.side=='LONG'?p>=t.tp1:p<=t.tp1;if(hitSl||hitTp){final pnl=(t.side=='LONG'?p-t.entry:t.entry-p)*t.qty;final idx=trades.indexWhere((x)=>x.id==t.id);trades[idx]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:hitSl?'SL':'TP',opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:pnl);paperBalance+=pnl;}}catch(_){} }setState((){});await _save();}
+  Future<void> _refreshPaper() async {
+    final open=trades.where((x)=>x.status=='OPEN').toList();
+    if(open.isEmpty){
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ بازی برای بررسی وجود ندارد.')));
+      return;
+    }
+    for(final t in open){
+      try{
+        final candles=await MarketApi.candles(t.symbol,'5m',limit:3);
+        final candle=candles.last;
+        final price=candle.close;
+        // Conservative rule: if SL and TP are both touched in the same candle, count SL first.
+        final hitSl=t.side=='LONG'?candle.low<=t.sl:candle.high>=t.sl;
+        final hitTp=t.side=='LONG'?candle.high>=t.tp1:candle.low<=t.tp1;
+        final closed=hitSl||hitTp;
+        // Use the exact exit level for a simulated stop/target; otherwise mark at latest close.
+        final exitPrice=closed?(hitSl?t.sl:t.tp1):price;
+        final pnl=(t.side=='LONG'?exitPrice-t.entry:t.entry-exitPrice)*t.qty;
+        final idx=trades.indexWhere((x)=>x.id==t.id);
+        if(idx<0) continue;
+        trades[idx]=PaperTrade(
+          id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',
+          opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:pnl,
+        );
+        if(closed) paperBalance+=pnl; // Add realized PnL to balance only once, when closing.
+      }catch(e){
+        // Keep the trade unchanged if market data cannot be fetched.
+      }
+    }
+    if(mounted){
+      setState((){});
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('قیمت معاملات مجازی به‌روزرسانی شد.')));
+    }
+    await _save();
+  }
   Future<void> _backtest() async {setState(() { loading=true; error=''; });try{final cs=await MarketApi.candles(symbol,tf,limit:500);int wins=0,loss=0, tradesN=0;double net=0;for(int i=60;i<cs.length-10;i+=3){final s=Indicators.analyze(symbol,tf,cs.sublist(0,i+1));if(s.side=='WAIT')continue;tradesN++;bool done=false;for(int j=i+1;j<math.min(i+11,cs.length);j++){final c=cs[j];if(s.side=='LONG'){if(c.low<=s.sl){loss++;net-=1;done=true;break;}if(c.high>=s.tp1){wins++;net+=1.5;done=true;break;}}else{if(c.high>=s.sl){loss++;net-=1;done=true;break;}if(c.low<=s.tp1){wins++;net+=1.5;done=true;break;}}}if(!done){loss++;net-=0.2;}}if(!mounted)return;showDialog(context:context,builder:(_)=>AlertDialog(title:const Text('نتیجهٔ بک‌تست تقریبی'),content:Text('نماد: $symbol • تایم‌فریم: $tf\nتعداد معاملات: $tradesN\nبرد: $wins • باخت: $loss\nبازده واحد ریسک: ${net.toStringAsFixed(2)}\n\nاین بک‌تست ساده است؛ کارمزد، اسلیپیج و funding را کامل مدل نمی‌کند و تضمین آینده نیست.'),actions:[TextButton(onPressed:()=>Navigator.pop(context),child:const Text('باشه'))]));}catch(e){setState(()=>error='Backtest failed: $e');}finally{if(mounted)setState(()=>loading=false);}}
   @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('سیگنال‌یار کریپتو'),centerTitle:true,actions:[IconButton(onPressed:_loadSymbols,icon:const Icon(Icons.refresh),tooltip:'به‌روزرسانی فهرست ارزها')]),body:IndexedStack(index:tab,children:[_analysisView(),_paperView(),_historyView()]),bottomNavigationBar:NavigationBar(selectedIndex:tab,onDestinationSelected:(i)=>setState(()=>tab=i),destinations:const [NavigationDestination(icon:Icon(Icons.insights),label:'تحلیل'),NavigationDestination(icon:Icon(Icons.account_balance_wallet),label:'Paper'),NavigationDestination(icon:Icon(Icons.history),label:'تاریخچه') ]));
   Widget _analysisView()=>ListView(padding:const EdgeInsets.all(16),children:[const Text('فیوچرز • داده عمومی • بدون اتصال حساب صرافی',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:16),Row(children:[Expanded(child:DropdownButtonFormField<String>(value:symbol,decoration:const InputDecoration(labelText:'ارز / قرارداد',border:OutlineInputBorder()),items:symbols.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>symbol=v??symbol))),const SizedBox(width:10),Expanded(child:DropdownButtonFormField<String>(value:tf,decoration:const InputDecoration(labelText:'تایم‌فریم',border:OutlineInputBorder()),items:MarketApi.intervals.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>tf=v??tf))) ]),const SizedBox(height:12),FilledButton.icon(onPressed:loading?null:_analyze,icon:loading?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.analytics),label:Text(loading?'در حال بررسی...':'تحلیل و دریافت سیگنال')),if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),if(current!=null)_signalCard(current!),const SizedBox(height:10),OutlinedButton.icon(onPressed:loading?null:_backtest,icon:const Icon(Icons.science),label:const Text('اجرای بک‌تست (تا ۵۰۰ کندل)')),const SizedBox(height:14),const Card(child:Padding(padding:EdgeInsets.all(12),child:Text('⚠️ این اپ پژوهشی است. مدل ML فقط پس از آموزش و جایگزینی فایل model_weights.json فعال می‌شود. بک‌تست تقریبی است و کارمزد/funding/slippage کامل ندارد. فقط حساب مجازی؛ هیچ سفارش واقعی ارسال نمی‌شود.',textDirection:TextDirection.rtl,style:TextStyle(height:1.5))))]);
   Widget _signalCard(Signal s)=>Card(color:const Color(0xFF1B2330),child:Padding(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[Text('${s.symbol} • ${s.interval}',textAlign:TextAlign.center),const SizedBox(height:8),Text(s.side=='LONG'?'LONG / خرید':s.side=='SHORT'?'SHORT / فروش':'WAIT / عدم ورود',textAlign:TextAlign.center,style:TextStyle(fontSize:24,fontWeight:FontWeight.bold,color:s.side=='LONG'?Colors.greenAccent:s.side=='SHORT'?Colors.redAccent:Colors.amber)),Text('تایید تایم‌فریم‌ها: $mtfSummary',textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),Text('امتیاز ${s.score} • ${model.trained?'احتمال مدل ML':'امتیاز تخمینی الگوریتم'} ${(s.probability*100).toStringAsFixed(0)}٪',textAlign:TextAlign.center),const Divider(height:24),_row('ورود',fmt(s.entry)),_row('حد ضرر',s.side=='WAIT'?'—':fmt(s.sl)),_row('حد سود ۱',s.side=='WAIT'?'—':fmt(s.tp1)),_row('حد سود ۲',s.side=='WAIT'?'—':fmt(s.tp2)),Text(s.reason,textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),if(s.side!='WAIT')FilledButton(onPressed:_openPaper,child:const Text('ثبت معاملهٔ مجازی'))] )));
   Widget _row(String a,String b)=>Padding(padding:const EdgeInsets.symmetric(vertical:4),child:Row(children:[Expanded(child:Text(a)),Text(b,style:const TextStyle(fontWeight:FontWeight.bold))]));
-  Widget _paperView()=>ListView(padding:const EdgeInsets.all(16),children:[Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),const SizedBox(height:10),Row(children:[const Text('ریسک هر معامله'),Expanded(child:Slider(value:riskPercent,min:0.25,max:3,divisions:11,label:'${riskPercent.toStringAsFixed(2)}%',onChanged:(v)=>setState(()=>riskPercent=v))),Text('${riskPercent.toStringAsFixed(2)}%')]),Row(children:[const Text('حداکثر اهرم'),Expanded(child:Slider(value:maxLeverage,min:1,max:5,divisions:4,label:'${maxLeverage.toStringAsFixed(0)}x',onChanged:(v)=>setState(()=>maxLeverage=v))),Text('${maxLeverage.toStringAsFixed(0)}x')]),FilledButton.icon(onPressed:_refreshPaper,icon:const Icon(Icons.sync),label:const Text('بررسی حد سود/ضرر معاملات باز')),const SizedBox(height:12),if(trades.isEmpty)const Text('هنوز معاملهٔ مجازی ثبت نشده است.'),...trades.map((t)=>Card(child:ListTile(title:Text('${t.symbol} • ${t.side} • ${t.status}'),subtitle:Text('ورود ${fmt(t.entry)} | SL ${fmt(t.sl)} | TP ${fmt(t.tp1)}'),trailing:Text('${t.pnl.toStringAsFixed(2)} USDT',style:TextStyle(color:t.pnl>=0?Colors.greenAccent:Colors.redAccent))))) ]);
+  Widget _paperView()=>ListView(padding:const EdgeInsets.all(16),children:[
+    Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
+    const SizedBox(height:6),
+    const Text('سود/ضرر معاملات باز پس از به‌روزرسانی، شناور است و تا بسته‌شدن به موجودی اضافه نمی‌شود.',style:TextStyle(color:Colors.white70)),
+    const SizedBox(height:10),
+    Row(children:[const Text('ریسک هر معامله'),Expanded(child:Slider(value:riskPercent,min:0.25,max:3,divisions:11,label:'${riskPercent.toStringAsFixed(2)}%',onChanged:(v)=>setState(()=>riskPercent=v))),Text('${riskPercent.toStringAsFixed(2)}%')]),
+    Row(children:[const Text('حداکثر اهرم'),Expanded(child:Slider(value:maxLeverage,min:1,max:5,divisions:4,label:'${maxLeverage.toStringAsFixed(0)}x',onChanged:(v)=>setState(()=>maxLeverage=v))),Text('${maxLeverage.toStringAsFixed(0)}x')]),
+    FilledButton.icon(onPressed:_refreshPaper,icon:const Icon(Icons.sync),label:const Text('به‌روزرسانی قیمت و بررسی حد سود/ضرر')),
+    const SizedBox(height:12),
+    if(trades.isEmpty)const Text('هنوز معاملهٔ مجازی ثبت نشده است.'),
+    ...trades.map((t)=>Card(child:ListTile(
+      title:Text('${t.symbol} • ${t.side} • ${t.status}'),
+      subtitle:Text('ورود ${fmt(t.entry)} | SL ${fmt(t.sl)} | TP ${fmt(t.tp1)} | حجم ${t.qty.toStringAsFixed(5)}'),
+      trailing:Text('${t.pnl.toStringAsFixed(2)} USDT\n${t.status=='OPEN'?'سود/ضرر شناور':'نتیجه نهایی'}',textAlign:TextAlign.end,style:TextStyle(color:t.pnl>=0?Colors.greenAccent:Colors.redAccent)),
+    ))),
+  ]);
   Widget _historyView()=>ListView(padding:const EdgeInsets.all(16),children:[Row(children:[const Expanded(child:Text('سیگنال‌های ذخیره‌شده',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold))),TextButton(onPressed:()async{setState(()=>history.clear());await _save();},child:const Text('پاک کردن'))]),if(history.isEmpty)const Text('تاریخچه خالی است.'),...history.map((s)=>Card(child:ListTile(title:Text('${s.symbol} • ${s.side}'),subtitle:Text('${s.interval} | ${s.time.toLocal()} | entry ${fmt(s.entry)} | نتیجه: ${s.outcome}'),trailing:Text('${(s.probability*100).toStringAsFixed(0)}%'))))]);
 }
