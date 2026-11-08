@@ -115,10 +115,64 @@ class Indicators {
   }
 }
 
+
 class MLModel {
-  bool trained=false; double bias=0; List<double> weights=[];
-  Future<void> load() async {try{final j=jsonDecode(await rootBundle.loadString('assets/model_weights.json'));trained=j['status']=='trained';bias=(j['bias'] as num).toDouble();weights=(j['weights'] as List).map((x)=>(x as num).toDouble()).toList();}catch(_){trained=false;}}
-  double? predict(List<double> features){if(!trained||weights.length!=features.length)return null;double z=bias;for(int i=0;i<features.length;i++)z+=weights[i]*features[i];z=z.clamp(-30,30).toDouble();return 1/(1+math.exp(-z));}
+  bool trained = false;
+  List<Map<String, dynamic>> models = [];
+
+  Future<void> load() async {
+    try {
+      final j = jsonDecode(await rootBundle.loadString('assets/model_weights.json'));
+      trained = j['status'] == 'trained' &&
+          j['models'] is List && (j['models'] as List).isNotEmpty;
+      models = trained
+          ? (j['models'] as List).map((e) => Map<String, dynamic>.from(e)).toList()
+          : [];
+    } catch (_) {
+      trained = false;
+      models = [];
+    }
+  }
+
+  double _sigmoid(double z) {
+    z = z.clamp(-30.0, 30.0).toDouble();
+    return 1.0 / (1.0 + math.exp(-z));
+  }
+
+  double _treeValue(Map<String, dynamic> tree, List<double> x) {
+    final nodes = (tree['nodes'] as List)
+        .map((e) => Map<String, dynamic>.from(e)).toList();
+    int idx = 0;
+    for (int steps = 0; steps < nodes.length + 2; steps++) {
+      if (idx < 0 || idx >= nodes.length) return 0;
+      final n = nodes[idx];
+      final leaf = n['value'];
+      if (leaf != null) return (leaf as num).toDouble();
+      final f = (n['feature'] as num).toInt();
+      final threshold = (n['threshold'] as num).toDouble();
+      final left = (n['left'] as num).toInt();
+      final right = (n['right'] as num).toInt();
+      if (f < 0 || f >= x.length) return 0;
+      idx = (n['lt'] == true ? x[f] < threshold : x[f] <= threshold) ? left : right;
+    }
+    return 0;
+  }
+
+  double? predict(List<double> features) {
+    if (!trained || features.length != 7) return null;
+    final probs = <double>[];
+    for (final m in models) {
+      final trees = (m['trees'] as List?) ?? const [];
+      double raw = ((m['bias'] as num?) ?? 0).toDouble();
+      for (final t in trees) {
+        raw += _treeValue(Map<String, dynamic>.from(t), features);
+      }
+      probs.add(_sigmoid(raw));
+    }
+    if (probs.isEmpty) return null;
+    // Ensemble averages model probabilities, not raw tree scores.
+    return probs.reduce((a, b) => a + b) / probs.length;
+  }
 }
 
 class HomePage extends StatefulWidget {const HomePage({super.key});@override State<HomePage> createState()=>_HomePageState();}
@@ -138,10 +192,11 @@ class _HomePageState extends State<HomePage> {
     for(final t in tfs){try{final data=t==tf?cs:await MarketApi.candles(symbol,t,limit:150);scores[t]=Indicators.trendScore(data);}catch(_){scores[t]=0;}}
     final total=scores.values.fold<int>(0,(a,b)=>a+b); mtfScore=total; mtfSummary=scores.entries.map((e)=>'${e.key}:${e.value>0?'↑':e.value<0?'↓':'—'}').join('  ');
     final raw=Indicators.analyze(symbol,tf,cs,mlProbability:prob); String side=raw.side;
-    // Strong opposing timeframe consensus suppresses the signal instead of forcing a trade.
-    if(total>=3 && raw.side!='SHORT') side=raw.side=='WAIT'?'LONG':raw.side;
-    else if(total<=-3 && raw.side!='LONG') side=raw.side=='WAIT'?'SHORT':raw.side;
-    else if((raw.side=='LONG'&&total<0)||(raw.side=='SHORT'&&total>0)) side='WAIT';
+    // MTF is a filter only: it may suppress an ML signal, never create one from WAIT.
+    if ((raw.side=='LONG' && total<=-2) ||
+        (raw.side=='SHORT' && total>=2)) {
+      side='WAIT';
+    }
     final risk=math.max(raw.atr*1.6,raw.entry*0.003).toDouble(); final sl=side=='LONG'?raw.entry-risk:side=='SHORT'?raw.entry+risk:raw.entry;
     final tp1=side=='LONG'?raw.entry+risk*1.5:side=='SHORT'?raw.entry-risk*1.5:raw.entry; final tp2=side=='LONG'?raw.entry+risk*2.5:side=='SHORT'?raw.entry-risk*2.5:raw.entry;
     final s=Signal(symbol:raw.symbol,interval:raw.interval,side:side,reason:'${raw.reason} • تایید چندتایم‌فریم: $mtfSummary',time:raw.time,entry:raw.entry,sl:sl,tp1:tp1,tp2:tp2,rsi:raw.rsi,atr:raw.atr,probability:raw.probability,score:raw.score+total);
@@ -190,9 +245,72 @@ class _HomePageState extends State<HomePage> {
     }
     await _save();
   }
-  Future<void> _backtest() async {setState(() { loading=true; error=''; });try{final cs=await MarketApi.candles(symbol,tf,limit:500);int wins=0,loss=0, tradesN=0;double net=0;for(int i=60;i<cs.length-10;i+=3){final s=Indicators.analyze(symbol,tf,cs.sublist(0,i+1));if(s.side=='WAIT')continue;tradesN++;bool done=false;for(int j=i+1;j<math.min(i+11,cs.length);j++){final c=cs[j];if(s.side=='LONG'){if(c.low<=s.sl){loss++;net-=1;done=true;break;}if(c.high>=s.tp1){wins++;net+=1.5;done=true;break;}}else{if(c.high>=s.sl){loss++;net-=1;done=true;break;}if(c.low<=s.tp1){wins++;net+=1.5;done=true;break;}}}if(!done){loss++;net-=0.2;}}if(!mounted)return;showDialog(context:context,builder:(_)=>AlertDialog(title:const Text('نتیجهٔ بک‌تست تقریبی'),content:Text('نماد: $symbol • تایم‌فریم: $tf\nتعداد معاملات: $tradesN\nبرد: $wins • باخت: $loss\nبازده واحد ریسک: ${net.toStringAsFixed(2)}\n\nاین بک‌تست ساده است؛ کارمزد، اسلیپیج و funding را کامل مدل نمی‌کند و تضمین آینده نیست.'),actions:[TextButton(onPressed:()=>Navigator.pop(context),child:const Text('باشه'))]));}catch(e){setState(()=>error='Backtest failed: $e');}finally{if(mounted)setState(()=>loading=false);}}
+  Future<void> _backtest() async {
+    setState(() { loading=true; error=''; });
+    try {
+      await model.load();
+      if (!model.trained) {
+        throw Exception('مدل Ensemble آموزش‌دیده پیدا نشد. ابتدا فایل assets/model_weights.json را از Colab جایگزین کن.');
+      }
+      final cs=await MarketApi.candles(symbol,tf,limit:500);
+      int wins=0, loss=0, tradesN=0;
+      double net=0, grossWin=0, grossLoss=0;
+      const feePerSide=0.0004;
+      const slippagePerSide=0.0002;
+      const costPct=2*(feePerSide+slippagePerSide);
+      int i=80;
+      while(i<cs.length-11){
+        final history=cs.sublist(0,i+1);
+        final p=model.predict(Indicators.features(history));
+        if(p==null){i++;continue;}
+        final s=Indicators.analyze(symbol,tf,history,mlProbability:p);
+        if(s.side=='WAIT'){i++;continue;}
+        final entry=s.entry;
+        final risk=(entry-s.sl).abs();
+        if(risk<=0){i++;continue;}
+        tradesN++;
+        bool done=false;
+        int exitIndex=i+10;
+        double resultR=-0.2;
+        for(int j=i+1;j<math.min(i+11,cs.length);j++){
+          final c=cs[j];
+          // Conservative same-candle assumption: count SL first.
+          if(s.side=='LONG'){
+            if(c.low<=s.sl){resultR=-1;done=true;exitIndex=j;break;}
+            if(c.high>=s.tp1){resultR=1.5;done=true;exitIndex=j;break;}
+          }else{
+            if(c.high>=s.sl){resultR=-1;done=true;exitIndex=j;break;}
+            if(c.low<=s.tp1){resultR=1.5;done=true;exitIndex=j;break;}
+          }
+        }
+        resultR-=(entry*costPct)/risk;
+        if(resultR>0){wins++;grossWin+=resultR;}else{loss++;grossLoss+=resultR.abs();}
+        net+=resultR;
+        // One simulated position at a time; avoid overlapping trades.
+        i=done?exitIndex+1:i+11;
+      }
+      if(!mounted)return;
+      final wr=tradesN==0?0:wins/tradesN*100;
+      final pf=grossLoss==0?(grossWin>0?'∞':'0'):(grossWin/grossLoss).toStringAsFixed(2);
+      showDialog(context:context,builder:(_)=>AlertDialog(
+        title:const Text('بک‌تست ML Ensemble'),
+        content:Text('نماد: $symbol • تایم‌فریم: $tf\n'
+          'مدل: XGBoost + LightGBM\n'
+          'معاملات: $tradesN • برد: $wins • باخت: $loss\n'
+          'درصد برد: ${wr.toStringAsFixed(1)}٪\n'
+          'Profit Factor: $pf\n'
+          'نتیجه خالص: ${net.toStringAsFixed(2)}R\n'
+          'هزینه فرضی رفت‌وبرگشت: ${(costPct*100).toStringAsFixed(2)}٪\n\n'
+          'Funding، spread و اجرای واقعی کامل شبیه‌سازی نشده‌اند؛ نتیجه تضمین آینده نیست.'),
+        actions:[TextButton(onPressed:()=>Navigator.pop(context),child:const Text('باشه'))]));
+    }catch(e){
+      setState(()=>error='Backtest failed: $e');
+    }finally{
+      if(mounted)setState(()=>loading=false);
+    }
+  }
   @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('سیگنال‌یار کریپتو'),centerTitle:true,actions:[IconButton(onPressed:_loadSymbols,icon:const Icon(Icons.refresh),tooltip:'به‌روزرسانی فهرست ارزها')]),body:IndexedStack(index:tab,children:[_analysisView(),_paperView(),_historyView()]),bottomNavigationBar:NavigationBar(selectedIndex:tab,onDestinationSelected:(i)=>setState(()=>tab=i),destinations:const [NavigationDestination(icon:Icon(Icons.insights),label:'تحلیل'),NavigationDestination(icon:Icon(Icons.account_balance_wallet),label:'Paper'),NavigationDestination(icon:Icon(Icons.history),label:'تاریخچه') ]));
-  Widget _analysisView()=>ListView(padding:const EdgeInsets.all(16),children:[const Text('فیوچرز • داده عمومی • بدون اتصال حساب صرافی',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:16),Row(children:[Expanded(child:DropdownButtonFormField<String>(value:symbol,decoration:const InputDecoration(labelText:'ارز / قرارداد',border:OutlineInputBorder()),items:symbols.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>symbol=v??symbol))),const SizedBox(width:10),Expanded(child:DropdownButtonFormField<String>(value:tf,decoration:const InputDecoration(labelText:'تایم‌فریم',border:OutlineInputBorder()),items:MarketApi.intervals.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>tf=v??tf))) ]),const SizedBox(height:12),FilledButton.icon(onPressed:loading?null:_analyze,icon:loading?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.analytics),label:Text(loading?'در حال بررسی...':'تحلیل و دریافت سیگنال')),if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),if(current!=null)_signalCard(current!),const SizedBox(height:10),OutlinedButton.icon(onPressed:loading?null:_backtest,icon:const Icon(Icons.science),label:const Text('اجرای بک‌تست (تا ۵۰۰ کندل)')),const SizedBox(height:14),const Card(child:Padding(padding:EdgeInsets.all(12),child:Text('⚠️ این اپ پژوهشی است. مدل ML فقط پس از آموزش و جایگزینی فایل model_weights.json فعال می‌شود. بک‌تست تقریبی است و کارمزد/funding/slippage کامل ندارد. فقط حساب مجازی؛ هیچ سفارش واقعی ارسال نمی‌شود.',textDirection:TextDirection.rtl,style:TextStyle(height:1.5))))]);
+  Widget _analysisView()=>ListView(padding:const EdgeInsets.all(16),children:[const Text('فیوچرز • داده عمومی • بدون اتصال حساب صرافی',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:16),Row(children:[Expanded(child:DropdownButtonFormField<String>(value:symbol,decoration:const InputDecoration(labelText:'ارز / قرارداد',border:OutlineInputBorder()),items:symbols.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>symbol=v??symbol))),const SizedBox(width:10),Expanded(child:DropdownButtonFormField<String>(value:tf,decoration:const InputDecoration(labelText:'تایم‌فریم',border:OutlineInputBorder()),items:MarketApi.intervals.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>tf=v??tf))) ]),const SizedBox(height:12),FilledButton.icon(onPressed:loading?null:_analyze,icon:loading?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.analytics),label:Text(loading?'در حال بررسی...':'تحلیل و دریافت سیگنال')),if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),if(current!=null)_signalCard(current!),const SizedBox(height:10),OutlinedButton.icon(onPressed:loading?null:_backtest,icon:const Icon(Icons.science),label:const Text('اجرای بک‌تست (تا ۵۰۰ کندل)')),const SizedBox(height:14),const Card(child:Padding(padding:EdgeInsets.all(12),child:Text('⚠️ این اپ پژوهشی است. مدل ML فقط پس از آموزش و جایگزینی فایل model_weights.json فعال می‌شود. بک‌تست از ML Ensemble استفاده می‌کند؛ کارمزد و اسلیپیج تقریبی‌اند و funding کامل مدل نشده است. فقط حساب مجازی؛ هیچ سفارش واقعی ارسال نمی‌شود.',textDirection:TextDirection.rtl,style:TextStyle(height:1.5))))]);
   Widget _signalCard(Signal s)=>Card(color:const Color(0xFF1B2330),child:Padding(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[Text('${s.symbol} • ${s.interval}',textAlign:TextAlign.center),const SizedBox(height:8),Text(s.side=='LONG'?'LONG / خرید':s.side=='SHORT'?'SHORT / فروش':'WAIT / عدم ورود',textAlign:TextAlign.center,style:TextStyle(fontSize:24,fontWeight:FontWeight.bold,color:s.side=='LONG'?Colors.greenAccent:s.side=='SHORT'?Colors.redAccent:Colors.amber)),Text('تایید تایم‌فریم‌ها: $mtfSummary',textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),Text('امتیاز ${s.score} • ${model.trained?'احتمال مدل ML':'امتیاز تخمینی الگوریتم'} ${(s.probability*100).toStringAsFixed(0)}٪',textAlign:TextAlign.center),const Divider(height:24),_row('ورود',fmt(s.entry)),_row('حد ضرر',s.side=='WAIT'?'—':fmt(s.sl)),_row('حد سود ۱',s.side=='WAIT'?'—':fmt(s.tp1)),_row('حد سود ۲',s.side=='WAIT'?'—':fmt(s.tp2)),Text(s.reason,textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),if(s.side!='WAIT')FilledButton(onPressed:_openPaper,child:const Text('ثبت معاملهٔ مجازی'))] )));
   Widget _row(String a,String b)=>Padding(padding:const EdgeInsets.symmetric(vertical:4),child:Row(children:[Expanded(child:Text(a)),Text(b,style:const TextStyle(fontWeight:FontWeight.bold))]));
   Widget _paperView()=>ListView(padding:const EdgeInsets.all(16),children:[
