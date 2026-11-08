@@ -1,27 +1,57 @@
+workflows:
+  android-workflow:
+    name: Crypto Signal Android
+    instance_type: mac_mini_m2
+    max_build_duration: 60
 
-name: crypto_signal_app
-description: Persian crypto futures signal research app
-publish_to: 'none'
-version: 1.0.0+1
+    environment:
+      flutter: stable
 
-environment:
-  sdk: '>=3.3.0 <4.0.0'
+    scripts:
+      - name: Generate Android project
+        script: flutter create --platforms=android .
 
-dependencies:
-  flutter:
-    sdk: flutter
-  http: ^1.2.2
-  shared_preferences: ^2.3.2
-  flutter_local_notifications: ^17.2.3
-  intl: ^0.19.0
+      - name: Configure Android internet and desugaring
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
 
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^4.0.0
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          xml = manifest.read_text()
+          permission = '    <uses-permission android:name="android.permission.INTERNET" />\\n'
+          if "android.permission.INTERNET" not in xml:
+              xml = xml.replace("<application", permission + "    <application", 1)
+              manifest.write_text(xml)
+          print("Internet permission ensured.")
 
-flutter:
-  uses-material-design: true
-  assets:
-    - assets/model_weights.json
-    
+          groovy = Path("android/app/build.gradle")
+          kotlin = Path("android/app/build.gradle.kts")
+          if groovy.exists():
+              gradle = groovy
+              flag = "coreLibraryDesugaringEnabled true"
+              dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
+          elif kotlin.exists():
+              gradle = kotlin
+              flag = "isCoreLibraryDesugaringEnabled = true"
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+          else:
+              raise Exception("Android app Gradle file not found")
+
+          s = gradle.read_text()
+          if flag not in s:
+              s = s.replace("compileOptions {", "compileOptions {\\n        " + flag, 1)
+          if dep not in s:
+              s = s.replace("dependencies {", "dependencies {\\n    " + dep, 1)
+          gradle.write_text(s)
+          print("Desugaring enabled in", gradle)
+          PY
+
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Build Android APK
+        script: flutter build apk --release
+
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
+      
