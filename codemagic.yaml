@@ -53,44 +53,60 @@ workflows:
           from pathlib import Path
           import re
 
-          p = Path('android/app/build.gradle.kts')
-          kotlin_dsl = p.exists()
+          gradle = Path('android/app/build.gradle.kts')
+          kotlin_dsl = gradle.exists()
           if not kotlin_dsl:
-              p = Path('android/app/build.gradle')
-          if not p.exists():
+              gradle = Path('android/app/build.gradle')
+          if not gradle.exists():
               raise SystemExit('ERROR: app Gradle file not found')
 
-          s = p.read_text()
+          s = gradle.read_text()
 
-          # Enable desugaring inside compileOptions.
-          flag = ('isCoreLibraryDesugaringEnabled = true' if kotlin_dsl
-                  else 'coreLibraryDesugaringEnabled true')
-          if flag not in s:
-              if re.search(r'compileOptions\\s*\\{', s):
-                  s = re.sub(r'compileOptions\\s*\\{',
-                             lambda m: m.group(0) + '\\n        ' + flag,
-                             s, count=1)
-              else:
-                  raise SystemExit('ERROR: compileOptions block not found')
+          # Add/enable compileOptions inside android { ... }.
+          if kotlin_dsl:
+              flag = 'isCoreLibraryDesugaringEnabled = true'
+              compile_block = '''compileOptions {
+                  isCoreLibraryDesugaringEnabled = true
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }'''
+              dep = 'coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+          else:
+              flag = 'coreLibraryDesugaringEnabled true'
+              compile_block = '''compileOptions {
+                  coreLibraryDesugaringEnabled true
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }'''
+              dep = "coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
 
-          # Ensure the dependency is in the app module.
-          dep = ('coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
-                 if kotlin_dsl else
-                 'coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.4"')
+          if 'compileOptions' not in s:
+              # Insert into android block immediately after its opening brace.
+              m = re.search(r'(?m)^android\\s*\\{', s)
+              if not m:
+                  raise SystemExit('ERROR: android { } block not found')
+              s = s[:m.end()] + '\\n    ' + compile_block + s[m.end():]
+          elif flag not in s:
+              # Existing compileOptions block: insert the desugaring flag.
+              m = re.search(r'compileOptions\\s*\\{', s)
+              if not m:
+                  raise SystemExit('ERROR: compileOptions block parsing failed')
+              s = s[:m.end()] + '\\n        ' + flag + s[m.end():]
+
           if 'desugar_jdk_libs' not in s:
-              if re.search(r'(?m)^dependencies\\s*\\{', s):
-                  s = re.sub(r'(?m)^dependencies\\s*\\{',
-                             lambda m: m.group(0) + '\\n    ' + dep,
-                             s, count=1)
+              m = re.search(r'(?m)^dependencies\\s*\\{', s)
+              if m:
+                  s = s[:m.end()] + '\\n    ' + dep + s[m.end():]
               else:
                   s += '\\n\\ndependencies {\\n    ' + dep + '\\n}\\n'
 
-          p.write_text(s)
-          print('Gradle file:', p)
-          print('Desugaring flag present:', flag in s)
-          print('Desugaring dependency present:', 'desugar_jdk_libs' in s)
+          gradle.write_text(s)
+          print('Gradle file configured:', gradle)
+          print('compileOptions found:', 'compileOptions' in s)
+          print('Desugaring flag found:', flag in s)
+          print('Desugaring dependency found:', 'desugar_jdk_libs' in s)
           if flag not in s or 'desugar_jdk_libs' not in s:
-              raise SystemExit('ERROR: desugaring configuration incomplete')
+              raise SystemExit('ERROR: desugaring not configured correctly')
           PY
 
       - name: Get Flutter packages
