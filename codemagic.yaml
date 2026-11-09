@@ -31,7 +31,7 @@ workflows:
           PY
 
       - name: Generate Android project
-        script: flutter create --org com.sohail.cryptolab --project-name crypto_signal_lab --platforms=android .
+        script: flutter create --org com.sohail.cryptolab.experimental --project-name crypto_signal_lab --platforms=android .
 
       - name: Set experimental app display name
         script: |
@@ -40,11 +40,11 @@ workflows:
           import re
           p = Path('android/app/src/main/AndroidManifest.xml')
           s = p.read_text()
-          s, count = re.subn(r'android:label="[^"]*"', 'android:label="Crypto Signal Lab"', s, count=1)
+          s, count = re.subn(r'android:label="[^"]*"', 'android:label="Crypto Signal Lab Test"', s, count=1)
           if count == 0:
               raise SystemExit('ERROR: Android app label not found')
           p.write_text(s)
-          print('Launcher label set to Crypto Signal Lab')
+          print('Launcher label set to Crypto Signal Lab Test')
           PY
 
       - name: Add Internet permission
