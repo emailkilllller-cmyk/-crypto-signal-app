@@ -13,7 +13,7 @@ class CryptoSignalApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'سیگنال‌یار کریپتو',
+    title: 'Crypto Signal Lab',
     theme: ThemeData.dark(useMaterial3: true).copyWith(
       scaffoldBackgroundColor: const Color(0xFF10141C),
       colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF35C99A), brightness: Brightness.dark),
@@ -50,14 +50,16 @@ class Signal {
 class PaperTrade {
   final String id, symbol, side, status;
   final DateTime opened;
-  final double entry, sl, tp1, qty, pnl;
+  final double entry, sl, tp1, qty, pnl, margin, entryFee, leverage;
   PaperTrade({required this.id,required this.symbol,required this.side,required this.status,required this.opened,
-    required this.entry,required this.sl,required this.tp1,required this.qty,required this.pnl});
+    required this.entry,required this.sl,required this.tp1,required this.qty,required this.pnl,
+    this.margin=0,this.entryFee=0,this.leverage=1});
   Map<String,dynamic> toJson()=>{'id':id,'symbol':symbol,'side':side,'status':status,'opened':opened.toIso8601String(),
-    'entry':entry,'sl':sl,'tp1':tp1,'qty':qty,'pnl':pnl};
+    'entry':entry,'sl':sl,'tp1':tp1,'qty':qty,'pnl':pnl,'margin':margin,'entryFee':entryFee,'leverage':leverage};
   factory PaperTrade.fromJson(Map<String,dynamic> j)=>PaperTrade(id:j['id'],symbol:j['symbol'],side:j['side'],status:j['status'],
     opened:DateTime.tryParse(j['opened']??'')??DateTime.now(),entry:(j['entry'] as num).toDouble(),sl:(j['sl'] as num).toDouble(),
-    tp1:(j['tp1'] as num).toDouble(),qty:(j['qty'] as num).toDouble(),pnl:(j['pnl'] as num).toDouble());
+    tp1:(j['tp1'] as num).toDouble(),qty:(j['qty'] as num).toDouble(),pnl:(j['pnl'] as num).toDouble(),
+    margin:(j['margin'] as num?)?.toDouble()??((j['qty'] as num).toDouble()*(j['entry'] as num).toDouble()),entryFee:(j['entryFee'] as num?)?.toDouble()??0,leverage:(j['leverage'] as num?)?.toDouble()??1);
 }
 
 class MarketApi {
@@ -80,13 +82,13 @@ class MarketApi {
     final s=symbol.replaceAll('-','');
     try {
       final r=await http.get(Uri.https('fapi.binance.com','/fapi/v1/klines',{'symbol':s,'interval':tf,'limit':'$limit'})).timeout(const Duration(seconds:15));
-      if(r.statusCode==200){final rows=jsonDecode(r.body) as List; if(rows.length>30) return rows.map<Candle>((e)=>Candle((e[0] as num).toInt(),double.parse('${e[1]}'),double.parse('${e[2]}'),double.parse('${e[3]}'),double.parse('${e[4]}'),double.parse('${e[5]}'))).toList();}
+      if(r.statusCode==200){final rows=jsonDecode(r.body) as List; if(rows.length>=math.min(limit,30)) return rows.map<Candle>((e)=>Candle((e[0] as num).toInt(),double.parse('${e[1]}'),double.parse('${e[2]}'),double.parse('${e[3]}'),double.parse('${e[4]}'),double.parse('${e[5]}'))).toList();}
     } catch (_) {}
     final inst='$symbol-SWAP';
     final r=await http.get(Uri.https('www.okx.com','/api/v5/market/candles',{'instId':inst,'bar':_okxBar(tf),'limit':'$limit'})).timeout(const Duration(seconds:15));
     if(r.statusCode!=200) throw Exception('OKX HTTP ${r.statusCode}');
     final j=jsonDecode(r.body); final rows=j['data'];
-    if(j['code']!='0'||rows is! List||rows.length<30) throw Exception('No candles / API ${j['msg']}');
+    if(j['code']!='0'||rows is! List||rows.length<math.min(limit,30)) throw Exception('No candles / API ${j['msg']}');
     return rows.map<Candle>((e)=>Candle(int.parse('${e[0]}'),double.parse('${e[1]}'),double.parse('${e[2]}'),double.parse('${e[3]}'),double.parse('${e[4]}'),double.parse('${e[5]}'))).toList().reversed.toList();
   }
 }
@@ -242,41 +244,86 @@ class _HomePageState extends State<HomePage> {
       if(result!='PENDING'){history[i]=Signal(symbol:h.symbol,interval:h.interval,side:h.side,reason:h.reason,time:h.time,entry:h.entry,sl:h.sl,tp1:h.tp1,tp2:h.tp2,rsi:h.rsi,atr:h.atr,probability:h.probability,score:h.score,outcome:result);changed=true;}
     } if(changed)_save();
   }
-  void _openPaper(){final s=current;if(s==null||s.side=='WAIT')return;final riskMoney=paperBalance*riskPercent/100;final distance=(s.entry-s.sl).abs();if(distance<=0)return;final qty=math.min(riskMoney/distance,(paperBalance*maxLeverage)/s.entry).toDouble();final t=PaperTrade(id:DateTime.now().microsecondsSinceEpoch.toString(),symbol:s.symbol,side:s.side,status:'OPEN',opened:DateTime.now(),entry:s.entry,sl:s.sl,tp1:s.tp1,qty:qty,pnl:0);setState(()=>trades.insert(0,t));_save();ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ مجازی ثبت شد؛ سفارش واقعی ارسال نمی‌شود.')));}
+  static const double _paperFeeRate=0.0004; // 0.04% per side, simulated taker fee.
+  double get _reservedPaperMargin => trades.where((t)=>t.status=='OPEN').fold(0.0,(a,t)=>a+t.margin);
+  double get _availablePaperBalance => math.max(0.0,paperBalance-_reservedPaperMargin).toDouble();
+  void _openPaper(){
+    final s=current;
+    if(s==null||s.side=='WAIT')return;
+    final distance=(s.entry-s.sl).abs();
+    final available=_availablePaperBalance;
+    if(distance<=0||s.entry<=0||available<=0){
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('موجودی آزاد یا فاصله حدضرر معتبر نیست.')));
+      return;
+    }
+    final riskMoney=available*riskPercent/100;
+    final maxNotional=available/(1/maxLeverage+_paperFeeRate);
+    final qty=math.min(riskMoney/distance,maxNotional/s.entry).toDouble();
+    final notional=qty*s.entry;
+    final margin=notional/maxLeverage;
+    final entryFee=notional*_paperFeeRate;
+    if(qty<=0||margin+entryFee>available){
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('موجودی آزاد برای ثبت این معامله کافی نیست.')));
+      return;
+    }
+    final now=DateTime.now();
+    final t=PaperTrade(id:now.microsecondsSinceEpoch.toString(),symbol:s.symbol,side:s.side,status:'OPEN',opened:now,
+      entry:s.entry,sl:s.sl,tp1:s.tp1,qty:qty,pnl:-entryFee,margin:margin,entryFee:entryFee,leverage:maxLeverage);
+    setState((){trades.insert(0,t);paperBalance-=entryFee;});
+    _save();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('معامله مجازی با اهرم ${maxLeverage.toStringAsFixed(0)}x ثبت شد؛ مارجین ${margin.toStringAsFixed(2)} و کارمزد ورود ${entryFee.toStringAsFixed(4)} USDT. سفارش واقعی ارسال نمی‌شود.')));
+  }
   Future<void> _refreshPaper() async {
     final open=trades.where((x)=>x.status=='OPEN').toList();
     if(open.isEmpty){
       if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ بازی برای بررسی وجود ندارد.')));
       return;
     }
+    int updated=0, failed=0;
+    final failures=<String>[];
     for(final t in open){
       try{
         final candles=await MarketApi.candles(t.symbol,'5m',limit:3);
+        if(candles.isEmpty) throw Exception('داده کندل خالی است');
         final candle=candles.last;
         final price=candle.close;
-        // Conservative rule: if SL and TP are both touched in the same candle, count SL first.
+        if(!price.isFinite||price<=0) throw Exception('قیمت دریافتی نامعتبر است');
+        // اگر SL و TP در یک کندل لمس شوند، برای جلوگیری از خوش‌بینی، SL اولویت دارد.
         final hitSl=t.side=='LONG'?candle.low<=t.sl:candle.high>=t.sl;
         final hitTp=t.side=='LONG'?candle.high>=t.tp1:candle.low<=t.tp1;
         final closed=hitSl||hitTp;
-        // Use the exact exit level for a simulated stop/target; otherwise mark at latest close.
         final exitPrice=closed?(hitSl?t.sl:t.tp1):price;
-        final pnl=(t.side=='LONG'?exitPrice-t.entry:t.entry-exitPrice)*t.qty;
+        final grossPnl=(t.side=='LONG'?exitPrice-t.entry:t.entry-exitPrice)*t.qty;
+        final exitFee=exitPrice*t.qty*_paperFeeRate;
+        // Entry fee was deducted at opening; include both fees in displayed net PnL.
+        final netPnl=grossPnl-t.entryFee-exitFee;
         final idx=trades.indexWhere((x)=>x.id==t.id);
         if(idx<0) continue;
-        trades[idx]=PaperTrade(
-          id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',
-          opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:pnl,
-        );
-        if(closed) paperBalance+=pnl; // Add realized PnL to balance only once, when closing.
+        trades[idx]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',
+          opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:netPnl,
+          margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
+        if(closed){
+          // Release margin by removing OPEN status; realize gross PnL less exit fee.
+          // Entry fee was already deducted from paperBalance at entry.
+          paperBalance+=grossPnl-exitFee;
+        }
+        updated++;
       }catch(e){
-        // Keep the trade unchanged if market data cannot be fetched.
+        failed++;
+        failures.add('${t.symbol}: $e');
       }
     }
     if(mounted){
       setState((){});
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('قیمت معاملات مجازی به‌روزرسانی شد.')));
+      final message=updated>0
+        ? 'قیمت $updated معامله به‌روزرسانی شد${failed>0?'؛ خطای دریافت برای $failed معامله':''}.'
+        : 'به‌روزرسانی انجام نشد؛ دریافت قیمت ناموفق بود.';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text(message),duration:const Duration(seconds:5)));
+      if(failed>0){
+        setState(()=>error='خطای به‌روزرسانی Paper:\n${failures.join('\n')}');
+      }
     }
-    await _save();
+    if(updated>0) await _save();
   }
   Future<void> _backtest() async {
     setState(() { loading=true; error=''; });
@@ -352,6 +399,7 @@ class _HomePageState extends State<HomePage> {
   Widget _row(String a,String b)=>Padding(padding:const EdgeInsets.symmetric(vertical:4),child:Row(children:[Expanded(child:Text(a)),Text(b,style:const TextStyle(fontWeight:FontWeight.bold))]));
   Widget _paperView()=>ListView(padding:const EdgeInsets.all(16),children:[
     Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
+    Text('موجودی آزاد: ${_availablePaperBalance.toStringAsFixed(2)} USDT • مارجین رزروشده: ${_reservedPaperMargin.toStringAsFixed(2)} USDT',style:const TextStyle(color:Colors.white70)),
     const SizedBox(height:6),
     const Text('سود/ضرر معاملات باز پس از به‌روزرسانی، شناور است و تا بسته‌شدن به موجودی اضافه نمی‌شود.',style:TextStyle(color:Colors.white70)),
     const SizedBox(height:10),
@@ -359,10 +407,11 @@ class _HomePageState extends State<HomePage> {
     Row(children:[const Text('حداکثر اهرم'),Expanded(child:Slider(value:maxLeverage,min:1,max:5,divisions:4,label:'${maxLeverage.toStringAsFixed(0)}x',onChanged:(v)=>setState(()=>maxLeverage=v))),Text('${maxLeverage.toStringAsFixed(0)}x')]),
     FilledButton.icon(onPressed:_refreshPaper,icon:const Icon(Icons.sync),label:const Text('به‌روزرسانی قیمت و بررسی حد سود/ضرر')),
     const SizedBox(height:12),
+    if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(bottom:8),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),
     if(trades.isEmpty)const Text('هنوز معاملهٔ مجازی ثبت نشده است.'),
     ...trades.map((t)=>Card(child:ListTile(
       title:Text('${t.symbol} • ${t.side} • ${t.status}'),
-      subtitle:Text('ورود ${fmt(t.entry)} | SL ${fmt(t.sl)} | TP ${fmt(t.tp1)} | حجم ${t.qty.toStringAsFixed(5)}'),
+      subtitle:Text('ورود ${fmt(t.entry)} | SL ${fmt(t.sl)} | TP ${fmt(t.tp1)} | حجم ${t.qty.toStringAsFixed(5)}\nاهرم ${t.leverage.toStringAsFixed(1)}x | مارجین ${t.margin.toStringAsFixed(2)} | کارمزد ورود ${t.entryFee.toStringAsFixed(4)}'),
       trailing:Text('${t.pnl.toStringAsFixed(2)} USDT\n${t.status=='OPEN'?'سود/ضرر شناور':'نتیجه نهایی'}',textAlign:TextAlign.end,style:TextStyle(color:t.pnl>=0?Colors.greenAccent:Colors.redAccent)),
     ))),
   ]);
