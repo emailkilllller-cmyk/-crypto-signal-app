@@ -97,6 +97,36 @@ class Indicators {
   static double atr(List<Candle> cs,int p){if(cs.length<=p)return 0;double s=0;for(int i=cs.length-p;i<cs.length;i++){final prev=cs[i-1].close; s+=math.max(cs[i].high-cs[i].low,math.max((cs[i].high-prev).abs(),(cs[i].low-prev).abs())).toDouble();}return s/p;}
   static List<double> emaSeries(List<double> x,int p){final out=List<double>.filled(x.length,0);if(x.isEmpty)return out;final k=2/(p+1);double v=x.first;out[0]=v;for(int i=1;i<x.length;i++){v=x[i]*k+v*(1-k);out[i]=v;}return out;}
   static double macdHist(List<double> c){if(c.length<35)return 0;final f=emaSeries(c,12),s=emaSeries(c,26);final line=List<double>.generate(c.length,(i)=>f[i]-s[i]);final sig=emaSeries(line.sublist(25),9);return line.last-sig.last;}
+  static double _midpoint(List<Candle> cs,int end,int period){
+    if(end+1<period||end<0)return 0;
+    double hi=-double.infinity,lo=double.infinity;
+    for(int i=end-period+1;i<=end;i++){hi=math.max(hi,cs[i].high).toDouble();lo=math.min(lo,cs[i].low).toDouble();}
+    return (hi+lo)/2;
+  }
+  // Ichimoku cloud at the current candle: spans are calculated 26 candles earlier
+  // because Senkou spans are projected 26 candles forward on the chart.
+  static int ichimokuScore(List<Candle> cs){
+    if(cs.length<78)return 0;
+    final last=cs.length-1, cloudAt=last-26, price=cs[last].close;
+    final tenkan=_midpoint(cs,last,9), kijun=_midpoint(cs,last,26);
+    final spanA=(_midpoint(cs,cloudAt,9)+_midpoint(cs,cloudAt,26))/2;
+    final spanB=_midpoint(cs,cloudAt,52);
+    final top=math.max(spanA,spanB).toDouble(), bottom=math.min(spanA,spanB).toDouble();
+    int score=0;
+    if(price>top)score++;else if(price<bottom)score--;
+    if(tenkan>kijun)score++;else if(tenkan<kijun)score--;
+    if(spanA>spanB)score++;else if(spanA<spanB)score--;
+    return score;
+  }
+  // Experimental conservative filter: MACD must agree and Ichimoku must not oppose.
+  static String applyExperimentalFilter(String side,List<Candle> cs){
+    if(side!='LONG'&&side!='SHORT')return side;
+    final closes=cs.map((x)=>x.close).toList();
+    final macd=macdHist(closes), ichi=ichimokuScore(cs);
+    if(side=='LONG'&&(macd<=0||ichi<0))return 'WAIT';
+    if(side=='SHORT'&&(macd>=0||ichi>0))return 'WAIT';
+    return side;
+  }
   static int trendScore(List<Candle> cs){
     if(cs.length<35)return 0; final c=cs.map((x)=>x.close).toList(); final e9=ema(c,9),e21=ema(c,21),r=rsi(c,14); int score=0;
     if(e9>e21)score+=2;else if(e9<e21)score-=2;
@@ -191,7 +221,10 @@ class _HomePageState extends State<HomePage> {
     final tfs=['15m','1h','4h']; final scores=<String,int>{};
     for(final t in tfs){try{final data=t==tf?cs:await MarketApi.candles(symbol,t,limit:150);scores[t]=Indicators.trendScore(data);}catch(_){scores[t]=0;}}
     final total=scores.values.fold<int>(0,(a,b)=>a+b); mtfScore=total; mtfSummary=scores.entries.map((e)=>'${e.key}:${e.value>0?'↑':e.value<0?'↓':'—'}').join('  ');
-    final raw=Indicators.analyze(symbol,tf,cs,mlProbability:prob); String side=raw.side;
+    final raw=Indicators.analyze(symbol,tf,cs,mlProbability:prob);
+    String side=Indicators.applyExperimentalFilter(raw.side,cs);
+    final ichi=Indicators.ichimokuScore(cs);
+    final macd=Indicators.macdHist(cs.map((x)=>x.close).toList());
     // MTF is a filter only: it may suppress an ML signal, never create one from WAIT.
     if ((raw.side=='LONG' && total<=-2) ||
         (raw.side=='SHORT' && total>=2)) {
@@ -199,7 +232,7 @@ class _HomePageState extends State<HomePage> {
     }
     final risk=math.max(raw.atr*1.6,raw.entry*0.003).toDouble(); final sl=side=='LONG'?raw.entry-risk:side=='SHORT'?raw.entry+risk:raw.entry;
     final tp1=side=='LONG'?raw.entry+risk*1.5:side=='SHORT'?raw.entry-risk*1.5:raw.entry; final tp2=side=='LONG'?raw.entry+risk*2.5:side=='SHORT'?raw.entry-risk*2.5:raw.entry;
-    final s=Signal(symbol:raw.symbol,interval:raw.interval,side:side,reason:'${raw.reason} • تایید چندتایم‌فریم: $mtfSummary',time:raw.time,entry:raw.entry,sl:sl,tp1:tp1,tp2:tp2,rsi:raw.rsi,atr:raw.atr,probability:raw.probability,score:raw.score+total);
+    final s=Signal(symbol:raw.symbol,interval:raw.interval,side:side,reason:'${raw.reason} • MTF: $mtfSummary • Ichimoku: ${ichi>0?'صعودی':ichi<0?'نزولی':'خنثی'} ($ichi) • MACD: ${macd>0?'صعودی':'نزولی'}',time:raw.time,entry:raw.entry,sl:sl,tp1:tp1,tp2:tp2,rsi:raw.rsi,atr:raw.atr,probability:raw.probability,score:raw.score+total+ichi);
     setState(()=>current=s); _evaluateHistory(symbol,raw.entry); if(s.side!='WAIT'){await _notifySignal(s);history.insert(0,s);if(history.length>500)history.removeLast();await _save();}
   }catch(e){setState(()=>error='دریافت داده ناموفق بود؛ ممکن است DNS یا دسترسی منطقه‌ای محدود باشد.\n$e');}finally{if(mounted)setState(()=>loading=false);}}
   void _evaluateHistory(String sym,double price){
@@ -263,8 +296,12 @@ class _HomePageState extends State<HomePage> {
         final history=cs.sublist(0,i+1);
         final p=model.predict(Indicators.features(history));
         if(p==null){i++;continue;}
-        final s=Indicators.analyze(symbol,tf,history,mlProbability:p);
-        if(s.side=='WAIT'){i++;continue;}
+        final raw=Indicators.analyze(symbol,tf,history,mlProbability:p);
+        final filteredSide=Indicators.applyExperimentalFilter(raw.side,history);
+        if(filteredSide=='WAIT'){i++;continue;}
+        final s=Signal(symbol:raw.symbol,interval:raw.interval,side:filteredSide,reason:raw.reason,
+          time:raw.time,entry:raw.entry,sl:raw.sl,tp1:raw.tp1,tp2:raw.tp2,rsi:raw.rsi,
+          atr:raw.atr,probability:raw.probability,score:raw.score);
         final entry=s.entry;
         final risk=(entry-s.sl).abs();
         if(risk<=0){i++;continue;}
@@ -293,7 +330,7 @@ class _HomePageState extends State<HomePage> {
       final wr=tradesN==0?0:wins/tradesN*100;
       final pf=grossLoss==0?(grossWin>0?'∞':'0'):(grossWin/grossLoss).toStringAsFixed(2);
       showDialog(context:context,builder:(_)=>AlertDialog(
-        title:const Text('بک‌تست ML Ensemble'),
+        title:const Text('بک‌تست آزمایشی ML + MACD + Ichimoku'),
         content:Text('نماد: $symbol • تایم‌فریم: $tf\n'
           'مدل: XGBoost + LightGBM\n'
           'معاملات: $tradesN • برد: $wins • باخت: $loss\n'
