@@ -57,6 +57,12 @@ def fetch_klines(symbol, interval, years):
     df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
+    # Binance includes the currently forming candle in klines responses.
+    # Keep only candles whose close_time has passed to avoid partial-bar leakage.
+    now_ms = int(time.time() * 1000)
+    df = df[df["close_time"].astype("int64") < now_ms].copy()
+    if df.empty:
+        raise RuntimeError("No fully closed historical candles received")
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     return df[["time", "open", "high", "low", "close", "volume"]]
 
@@ -221,7 +227,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--interval", default="1h")
-    ap.add_argument("--years", type=float, default=3.0)
+    ap.add_argument("--years", type=float, default=5.0)
     ap.add_argument("--horizon", type=int, default=12)
     ap.add_argument("--label-threshold", type=float, default=0.5)
     ap.add_argument("--initial", type=float, default=10000.0)
@@ -230,7 +236,7 @@ def main():
     ap.add_argument("--out", default="research_output")
     args = ap.parse_args()
 
-    print(f"Downloading {args.symbol} {args.interval}, approximately {args.years} years...")
+    print(f"Downloading {args.symbol} {args.interval}, approximately {args.years} years of CLOSED candles...")
     raw = fetch_klines(args.symbol, args.interval, args.years)
     start_ms, end_ms = int(raw.time.iloc[0].timestamp()*1000), int(raw.time.iloc[-1].timestamp()*1000)
     funding = fetch_funding(args.symbol, start_ms, end_ms)
@@ -246,6 +252,15 @@ def main():
     train = data.iloc[:train_end-args.horizon]
     val = data.iloc[train_end:val_end-args.horizon]
     test = data.iloc[val_end:]
+    if min(len(train), len(val), len(test)) < 100:
+        raise RuntimeError(
+            f"Insufficient rows after purging split boundaries: "
+            f"train={len(train)}, validation={len(val)}, test={len(test)}. "
+            "Increase --years or use a shorter interval."
+        )
+    # Explicitly assert chronological, non-overlapping partitions.
+    if not (train.time.max() < val.time.min() < test.time.min()):
+        raise RuntimeError("Train/validation/test partitions are not chronological and disjoint")
     model = RandomForestClassifier(n_estimators=400, max_depth=8, min_samples_leaf=12,
                                    max_features="sqrt", class_weight="balanced_subsample",
                                    random_state=42, n_jobs=-1)
@@ -285,7 +300,8 @@ def main():
         "validation_start": val.time.iloc[0].isoformat(),
         "validation_end": val.time.iloc[-1].isoformat(),
         "test_start": test.time.iloc[0].isoformat(), "test_end": test.time.iloc[-1].isoformat(),
-        "split": "70% train / 15% validation / 15% untouched test (chronological)",
+        "split": "70% train / 15% validation / 15% untouched test (chronological; horizon purged at train/validation boundaries)",
+        "closed_candles_only": True,
         "label": f"{args.horizon}-bar forward return: UP > +{args.label_threshold}%, DOWN < -{args.label_threshold}%, otherwise NEUTRAL",
         "model": "RandomForestClassifier, 400 trees, max_depth=8",
         "ml_confidence_threshold_selected_on_validation": best_threshold,
