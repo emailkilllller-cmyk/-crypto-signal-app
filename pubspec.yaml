@@ -1,8 +1,7 @@
 name: crypto_signal_app
 description: Persian crypto futures signal research app
 publish_to: 'none'
-version: 1.0.0+1
-
+version: 1.0.1+2
 environment:
   sdk: '>=3.3.0 <4.0.0'
 
