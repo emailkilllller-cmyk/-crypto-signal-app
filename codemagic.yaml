@@ -5,6 +5,8 @@ workflows:
     max_build_duration: 60
 
     environment:
+      android_signing:
+        - crypto_signal_release
       flutter: stable
 
     scripts:
@@ -127,6 +129,96 @@ workflows:
               raise SystemExit('ERROR: desugaring not configured correctly')
           PY
 
+      - name: Configure Android release signing
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          gradle = Path('android/app/build.gradle.kts')
+          kotlin_dsl = gradle.exists()
+          if not kotlin_dsl:
+              gradle = Path('android/app/build.gradle')
+          if not gradle.exists():
+              raise SystemExit('ERROR: Android app Gradle file not found')
+
+          s = gradle.read_text()
+
+          if kotlin_dsl:
+              signing_block = '''
+              signingConfigs {
+                  create("release") {
+                      if (System.getenv()["CI"].toBoolean()) {
+                          storeFile = file(System.getenv()["CM_KEYSTORE_PATH"]
+                              ?: error("CM_KEYSTORE_PATH is missing"))
+                          storePassword = System.getenv()["CM_KEYSTORE_PASSWORD"]
+                              ?: error("CM_KEYSTORE_PASSWORD is missing")
+                          keyAlias = System.getenv()["CM_KEY_ALIAS"]
+                              ?: error("CM_KEY_ALIAS is missing")
+                          keyPassword = System.getenv()["CM_KEY_PASSWORD"]
+                              ?: error("CM_KEY_PASSWORD is missing")
+                      }
+                  }
+              }
+              '''
+              release_signing = 'signingConfig = signingConfigs.getByName("release")'
+              debug_signing = 'signingConfig = signingConfigs.getByName("debug")'
+          else:
+              signing_block = '''
+              signingConfigs {
+                  release {
+                      if (System.getenv()["CI"]) {
+                          storeFile file(System.getenv()["CM_KEYSTORE_PATH"])
+                          storePassword System.getenv()["CM_KEYSTORE_PASSWORD"]
+                          keyAlias System.getenv()["CM_KEY_ALIAS"]
+                          keyPassword System.getenv()["CM_KEY_PASSWORD"]
+                      }
+                  }
+              }
+              '''
+              release_signing = 'signingConfig signingConfigs.release'
+              debug_signing = 'signingConfig signingConfigs.debug'
+
+          if 'signingConfigs' in s and 'create("release")' in s or (
+              'signingConfigs' in s and re.search(r'(?s)signingConfigs\s*\{.*?release\s*\{', s)
+          ):
+              raise SystemExit('ERROR: A release signing config already exists; refusing to duplicate it')
+
+          # Insert the release signing config inside android {}, immediately before buildTypes.
+          m = re.search(r'(?m)^\s*buildTypes\s*\{', s)
+          if not m:
+              raise SystemExit('ERROR: buildTypes block not found in generated Gradle file')
+          s = s[:m.start()] + signing_block + '\n' + s[m.start():]
+
+          # Replace the generated debug signing assignment in the release build type.
+          if debug_signing in s:
+              s = s.replace(debug_signing, release_signing, 1)
+          elif release_signing not in s:
+              # If the template has no explicit signing line, insert it into release { }.
+              m = re.search(r'(?m)^\s*release\s*\{', s)
+              if not m:
+                  raise SystemExit('ERROR: release build type block not found')
+              brace = s.find('{', m.start())
+              depth = 0
+              end = None
+              for i in range(brace, len(s)):
+                  if s[i] == '{':
+                      depth += 1
+                  elif s[i] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end = i
+                          break
+              if end is None:
+                  raise SystemExit('ERROR: could not parse release build type block')
+              s = s[:end] + '\n        ' + release_signing + '\n    ' + s[end:]
+
+          gradle.write_text(s)
+          if release_signing not in s:
+              raise SystemExit('ERROR: release signing assignment was not applied')
+          print('Android release signing configured in', gradle)
+          print('Codemagic keystore reference: crypto_signal_release')
+          PY
       - name: Get Flutter packages
         script: flutter pub get
 
