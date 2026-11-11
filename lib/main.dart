@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -208,13 +209,63 @@ class MLModel {
 }
 
 class HomePage extends StatefulWidget {const HomePage({super.key});@override State<HomePage> createState()=>_HomePageState();}
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+  Timer? _monitorTimer; bool _monitorBusy=false; DateTime? _lastMonitorAt;
   final MLModel model=MLModel(); final FlutterLocalNotificationsPlugin notifications=FlutterLocalNotificationsPlugin(); int tab=0; String symbol='BTC-USDT',tf='1h'; bool loading=false; String error=''; List<String> symbols=['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','LINK-USDT','AVAX-USDT']; Signal? current; List<Signal> history=[]; List<PaperTrade> trades=[]; double paperBalance=10000; double riskPercent=1; double maxLeverage=5; bool autoLeverage=true; int mtfScore=0; String mtfSummary='';
-  @override void initState(){super.initState();_load();_loadSymbols();model.load();_initNotifications();}
+  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);_load().then((_)=>_autoMonitorTick());_loadSymbols();model.load();_initNotifications();_monitorTimer=Timer.periodic(const Duration(seconds:15),(_)=>_autoMonitorTick());}
+  @override void didChangeAppLifecycleState(AppLifecycleState state){if(state==AppLifecycleState.resumed){_autoMonitorTick();}}
+  @override void dispose(){_monitorTimer?.cancel();WidgetsBinding.instance.removeObserver(this);super.dispose();}
   Future<void> _initNotifications() async {try{const settings=InitializationSettings(android:AndroidInitializationSettings('@mipmap/ic_launcher'));await notifications.initialize(settings);await notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();}catch(_){}}
   Future<void> _notifySignal(Signal s) async {try{await notifications.show(100,'سیگنال ${s.side} • ${s.symbol}','ورود ${fmt(s.entry)} | SL ${fmt(s.sl)} | TP ${fmt(s.tp1)}',const NotificationDetails(android:AndroidNotificationDetails('crypto_signals','Crypto Signals',channelDescription:'Signal alerts',importance:Importance.high,priority:Priority.high)));}catch(_){}}
   Future<void> _load() async {final p=await SharedPreferences.getInstance();setState((){history=(jsonDecode(p.getString('history')??'[]') as List).map((e)=>Signal.fromJson(e)).toList();trades=(jsonDecode(p.getString('paperTrades')??'[]') as List).map((e)=>PaperTrade.fromJson(e)).toList();paperBalance=p.getDouble('paperBalance')??10000;});}
   Future<void> _save() async {final p=await SharedPreferences.getInstance();await p.setString('history',jsonEncode(history.map((x)=>x.toJson()).toList()));await p.setString('paperTrades',jsonEncode(trades.map((x)=>x.toJson()).toList()));await p.setDouble('paperBalance',paperBalance);}
+  Future<void> _autoMonitorTick() async {
+    if(!mounted||_monitorBusy||WidgetsBinding.instance.lifecycleState!=AppLifecycleState.resumed)return;
+    final pending=history.where((h)=>h.outcome=='PENDING'&&h.side!='WAIT').map((h)=>h.symbol);
+    final open=trades.where((t)=>t.status=='OPEN').map((t)=>t.symbol);
+    final watch=<String>{...pending,...open};
+    if(watch.isEmpty)return;
+    _monitorBusy=true; bool changed=false; final failures=<String>[];
+    try{
+      for(final sym in watch){
+        try{
+          final candles=await MarketApi.candles(sym,'5m',limit:3);
+          if(candles.isEmpty)throw Exception('کندل خالی');
+          final c=candles.last; if(!c.close.isFinite||c.close<=0)throw Exception('قیمت نامعتبر');
+          // Historical signals: use candle extremes so intrabar TP/SL touches are not missed.
+          for(var i=0;i<history.length;i++){
+            final h=history[i]; if(h.symbol!=sym||h.outcome!='PENDING'||h.side=='WAIT')continue;
+            final hitSl=h.side=='LONG'?c.low<=h.sl:c.high>=h.sl;
+            final hitTp=h.side=='LONG'?c.high>=h.tp1:c.low<=h.tp1;
+            if(hitSl||hitTp){
+              final outcome=hitSl?'SL':'TP1';
+              history[i]=Signal(symbol:h.symbol,interval:h.interval,side:h.side,reason:h.reason,time:h.time,entry:h.entry,sl:h.sl,tp1:h.tp1,tp2:h.tp2,rsi:h.rsi,atr:h.atr,probability:h.probability,score:h.score,outcome:outcome);
+              changed=true;
+              await _notifyOutcome(h,outcome);
+            }
+          }
+          // Paper positions: conservative SL priority if both levels are touched in one candle.
+          for(var i=0;i<trades.length;i++){
+            final t=trades[i]; if(t.symbol!=sym||t.status!='OPEN')continue;
+            final hitSl=t.side=='LONG'?c.low<=t.sl:c.high>=t.sl;
+            final hitTp=t.side=='LONG'?c.high>=t.tp1:c.low<=t.tp1;
+            final closed=hitSl||hitTp; final exit=closed?(hitSl?t.sl:t.tp1):c.close;
+            final gross=(t.side=='LONG'?exit-t.entry:t.entry-exit)*t.qty;
+            final exitFee=closed?exit*t.qty*_paperFeeRate:0.0;
+            final net=closed?gross-t.entryFee-exitFee:(t.side=='LONG'?c.close-t.entry:t.entry-c.close)*t.qty-t.entryFee;
+            trades[i]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:net,margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
+            if(closed){paperBalance+=gross-exitFee;await _notifyTradeClose(t,hitSl?'SL':'TP');}
+            changed=true;
+          }
+        }catch(e){failures.add('$sym: $e');}
+      }
+      if(changed){await _save();if(mounted)setState(()=>_lastMonitorAt=DateTime.now());}
+      else if(mounted)setState(()=>_lastMonitorAt=DateTime.now());
+      if(failures.isNotEmpty&&mounted)setState(()=>error='خطای پایش خودکار (داده تازه دریافت نشد):\n${failures.join('\n')}');
+    }finally{_monitorBusy=false;}
+  }
+  Future<void> _notifyOutcome(Signal s,String outcome) async {try{await notifications.show(200+s.time.millisecondsSinceEpoch.remainder(100000),'نتیجه سیگنال ${s.symbol}','$outcome • ورود ${fmt(s.entry)}',const NotificationDetails(android:AndroidNotificationDetails('signal_results','Signal Results',channelDescription:'Signal TP/SL results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
+  Future<void> _notifyTradeClose(PaperTrade t,String outcome) async {try{await notifications.show(300+t.id.hashCode.abs().remainder(100000),'معامله مجازی ${t.symbol} بسته شد','$outcome • نتیجه ${t.pnl.toStringAsFixed(2)} USDT',const NotificationDetails(android:AndroidNotificationDetails('paper_results','Paper Results',channelDescription:'Paper trade results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
   Future<void> _loadSymbols() async {try{final list=await MarketApi.symbols();if(mounted)setState(()=>symbols=list);}catch(_) {}}
   String fmt(double n)=>n.abs()>=100?n.toStringAsFixed(2):n.toStringAsFixed(5);
   Future<void> _analyze() async {setState(() { loading=true; error=''; });try{
@@ -401,7 +452,8 @@ class _HomePageState extends State<HomePage> {
     Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
     Text('موجودی آزاد: ${_availablePaperBalance.toStringAsFixed(2)} USDT • مارجین رزروشده: ${_reservedPaperMargin.toStringAsFixed(2)} USDT',style:const TextStyle(color:Colors.white70)),
     const SizedBox(height:6),
-    const Text('سود/ضرر معاملات باز پس از به‌روزرسانی، شناور است و تا بسته‌شدن به موجودی اضافه نمی‌شود.',style:TextStyle(color:Colors.white70)),
+    const Text('پایش خودکار هر ۱۵ ثانیه هنگام باز و فعال بودن برنامه؛ در پس‌زمینه/پس از بسته‌شدن تضمین‌شده نیست.',style:TextStyle(color:Colors.greenAccent)),
+    if(_lastMonitorAt!=null)Text('آخرین بررسی: ${_lastMonitorAt!.toLocal()}',style:const TextStyle(color:Colors.white54)),
     const SizedBox(height:10),
     Row(children:[const Text('ریسک هر معامله'),Expanded(child:Slider(value:riskPercent,min:0.25,max:3,divisions:11,label:'${riskPercent.toStringAsFixed(2)}%',onChanged:(v)=>setState(()=>riskPercent=v))),Text('${riskPercent.toStringAsFixed(2)}%')]),
     Row(children:[const Text('حداکثر اهرم'),Expanded(child:Slider(value:maxLeverage,min:1,max:5,divisions:4,label:'${maxLeverage.toStringAsFixed(0)}x',onChanged:(v)=>setState(()=>maxLeverage=v))),Text('${maxLeverage.toStringAsFixed(0)}x')]),
