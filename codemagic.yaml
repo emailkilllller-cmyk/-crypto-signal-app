@@ -31,7 +31,7 @@ workflows:
           PY
 
       - name: Generate Android project
-        script: flutter create --org com.sohail.cryptolab.experimental --project-name crypto_signal_lab --platforms=android .
+        script: flutter create --org com.sohail.cryptolab --project-name crypto_signal_lab --platforms=android .
 
       - name: Set experimental app display name
         script: |
