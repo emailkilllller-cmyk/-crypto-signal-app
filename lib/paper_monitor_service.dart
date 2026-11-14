@@ -10,13 +10,19 @@ void startPaperMonitorCallback() {
 
 class PaperMonitorTaskHandler extends TaskHandler {
   bool _busy = false;
+  Future<void>? _activeTick;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
 
   @override
   void onRepeatEvent(DateTime timestamp) {
-    _tick();
+    if (_activeTick != null) return;
+    final tick = _tick();
+    _activeTick = tick;
+    tick.whenComplete(() {
+      if (identical(_activeTick, tick)) _activeTick = null;
+    });
   }
 
   Future<void> _tick() async {
@@ -93,5 +99,9 @@ class PaperMonitorTaskHandler extends TaskHandler {
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp) async {}
+  Future<void> onDestroy(DateTime timestamp) async {
+    // stopService must not return while this isolate is still writing SharedPreferences.
+    final activeTick = _activeTick;
+    if (activeTick != null) await activeTick;
+  }
 }
