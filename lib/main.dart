@@ -250,7 +250,7 @@ class MLModel {
 
 class HomePage extends StatefulWidget {const HomePage({super.key});@override State<HomePage> createState()=>_HomePageState();}
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  Timer? _monitorTimer; bool _monitorBusy=false; DateTime? _lastMonitorAt; Future<void> _serviceTransition=Future<void>.value();
+  Timer? _monitorTimer; bool _monitorBusy=false; Completer<void>? _monitorCompletion; DateTime? _lastMonitorAt; Future<void> _serviceTransition=Future<void>.value();
   final MLModel model=MLModel(); final FlutterLocalNotificationsPlugin notifications=FlutterLocalNotificationsPlugin(); int tab=0; String symbol='BTC-USDT',tf='1h'; bool loading=false; String error=''; List<String> symbols=['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','LINK-USDT','AVAX-USDT']; Signal? current; List<Signal> history=[]; List<NoEntryRecord> noEntryHistory=[]; List<PaperTrade> trades=[]; double paperBalance=10000; double riskPercent=1; double maxLeverage=5; bool autoLeverage=true; int mtfScore=0; String mtfSummary='';
   @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);_initForegroundService();_load().then((_)=>_autoMonitorTick());_loadSymbols();model.load();_initNotifications();_monitorTimer=Timer.periodic(const Duration(seconds:15),(_)=>_autoMonitorTick());}
   Future<void> _initForegroundService() async {
@@ -258,6 +258,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try { await FlutterForegroundTask.requestNotificationPermission(); } catch (_) {}
   }
   Future<void> _startBackgroundMonitor() async {
+    // Do not hand storage ownership to the service while a foreground tick is active.
+    final activeTick = _monitorCompletion;
+    if (activeTick != null) await activeTick.future;
     final p=await SharedPreferences.getInstance();
     await p.setString('paperMonitorOwner','transition');
     if(!await FlutterForegroundTask.isRunningService){
@@ -267,8 +270,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
   Future<void> _stopBackgroundMonitor() async {
     final p=await SharedPreferences.getInstance();
-    await p.setString('paperMonitorOwner','foreground');
+    // Block new background writes first, then wait for the service to finish any
+    // tick already in progress before the foreground reads or writes paper data.
+    await p.setString('paperMonitorOwner','transition');
     if(await FlutterForegroundTask.isRunningService){await FlutterForegroundTask.stopService();}
+    await p.setString('paperMonitorOwner','foreground');
   }
   @override void didChangeAppLifecycleState(AppLifecycleState state){
     if(state==AppLifecycleState.resumed){
@@ -288,7 +294,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final open=trades.where((t)=>t.status=='OPEN').map((t)=>t.symbol);
     final watch=<String>{...pending,...open};
     if(watch.isEmpty)return;
-    _monitorBusy=true; bool changed=false; final failures=<String>[];
+    _monitorBusy=true; _monitorCompletion=Completer<void>(); bool changed=false; final failures=<String>[];
     try{
       for(final sym in watch){
         try{
@@ -324,7 +330,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if(changed){await _save();if(mounted)setState(()=>_lastMonitorAt=DateTime.now());}
       else if(mounted)setState(()=>_lastMonitorAt=DateTime.now());
       if(failures.isNotEmpty&&mounted)setState(()=>error='خطای پایش خودکار (داده تازه دریافت نشد):\n${failures.join('\n')}');
-    }finally{_monitorBusy=false;}
+    }finally{
+      _monitorBusy=false;
+      final completion=_monitorCompletion;
+      _monitorCompletion=null;
+      if(completion!=null&&!completion.isCompleted)completion.complete();
+    }
   }
   Future<void> _notifyOutcome(Signal s,String outcome) async {try{await notifications.show(200+s.time.millisecondsSinceEpoch.remainder(100000),'نتیجه سیگنال ${s.symbol}','$outcome • ورود ${fmt(s.entry)}',const NotificationDetails(android:AndroidNotificationDetails('signal_results','Signal Results',channelDescription:'Signal TP/SL results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
   Future<void> _notifyTradeClose(PaperTrade t,String outcome) async {try{await notifications.show(300+t.id.hashCode.abs().remainder(100000),'معامله مجازی ${t.symbol} بسته شد','$outcome • نتیجه ${t.pnl.toStringAsFixed(2)} USDT',const NotificationDetails(android:AndroidNotificationDetails('paper_results','Paper Results',channelDescription:'Paper trade results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
