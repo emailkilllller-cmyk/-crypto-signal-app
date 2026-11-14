@@ -6,8 +6,14 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'paper_monitor_service.dart';
 
-void main() => runApp(const CryptoSignalApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterForegroundTask.initCommunicationPort();
+  runApp(const CryptoSignalApp());
+}
 
 class CryptoSignalApp extends StatelessWidget {
   const CryptoSignalApp({super.key});
@@ -111,6 +117,20 @@ class MarketApi {
     final j=jsonDecode(r.body); final rows=j['data'];
     if(j['code']!='0'||rows is! List||rows.length<math.min(limit,30)) throw Exception('No candles / API ${j['msg']}');
     return rows.map<Candle>((e)=>Candle(int.parse('${e[0]}'),double.parse('${e[1]}'),double.parse('${e[2]}'),double.parse('${e[3]}'),double.parse('${e[4]}'),double.parse('${e[5]}'))).toList().reversed.toList();
+  }
+  static Future<double> lastPrice(String symbol) async {
+    final pair=symbol.replaceAll('-','');
+    try {
+      final r=await http.get(Uri.https('fapi.binance.com','/fapi/v1/ticker/price',{'symbol':pair})).timeout(const Duration(seconds:10));
+      if(r.statusCode==200){final v=double.tryParse('${jsonDecode(r.body)['price']}');if(v!=null&&v>0)return v;}
+    } catch (_) {}
+    final r=await http.get(Uri.https('www.okx.com','/api/v5/market/ticker',{'instId':'$symbol-SWAP'})).timeout(const Duration(seconds:10));
+    if(r.statusCode!=200)throw Exception('خطای دریافت قیمت: HTTP ${r.statusCode}');
+    final j=jsonDecode(r.body);final data=j['data'];
+    if(j['code']!='0'||data is! List||data.isEmpty)throw Exception('قیمت لحظه‌ای OKX در دسترس نیست');
+    final v=double.tryParse('${data.first['last']}');
+    if(v==null||v<=0)throw Exception('قیمت دریافتی نامعتبر است');
+    return v;
   }
 }
 
@@ -230,10 +250,33 @@ class MLModel {
 
 class HomePage extends StatefulWidget {const HomePage({super.key});@override State<HomePage> createState()=>_HomePageState();}
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  Timer? _monitorTimer; bool _monitorBusy=false; DateTime? _lastMonitorAt;
+  Timer? _monitorTimer; bool _monitorBusy=false; DateTime? _lastMonitorAt; Future<void> _serviceTransition=Future<void>.value();
   final MLModel model=MLModel(); final FlutterLocalNotificationsPlugin notifications=FlutterLocalNotificationsPlugin(); int tab=0; String symbol='BTC-USDT',tf='1h'; bool loading=false; String error=''; List<String> symbols=['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','LINK-USDT','AVAX-USDT']; Signal? current; List<Signal> history=[]; List<NoEntryRecord> noEntryHistory=[]; List<PaperTrade> trades=[]; double paperBalance=10000; double riskPercent=1; double maxLeverage=5; bool autoLeverage=true; int mtfScore=0; String mtfSummary='';
-  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);_load().then((_)=>_autoMonitorTick());_loadSymbols();model.load();_initNotifications();_monitorTimer=Timer.periodic(const Duration(seconds:15),(_)=>_autoMonitorTick());}
-  @override void didChangeAppLifecycleState(AppLifecycleState state){if(state==AppLifecycleState.resumed){_autoMonitorTick();}}
+  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);_initForegroundService();_load().then((_)=>_autoMonitorTick());_loadSymbols();model.load();_initNotifications();_monitorTimer=Timer.periodic(const Duration(seconds:15),(_)=>_autoMonitorTick());}
+  Future<void> _initForegroundService() async {
+    FlutterForegroundTask.init(androidNotificationOptions:AndroidNotificationOptions(channelId:'paper_monitor',channelName:'Paper trade monitoring',channelDescription:'Monitors open paper trades every 15 seconds',onlyAlertOnce:true),iosNotificationOptions:const IOSNotificationOptions(showNotification:false,playSound:false),foregroundTaskOptions:ForegroundTaskOptions(eventAction:ForegroundTaskEventAction.repeat(15000),allowWakeLock:true,allowWifiLock:true,allowAutoRestart:true));
+    try { await FlutterForegroundTask.requestNotificationPermission(); } catch (_) {}
+  }
+  Future<void> _startBackgroundMonitor() async {
+    final p=await SharedPreferences.getInstance();
+    await p.setString('paperMonitorOwner','transition');
+    if(!await FlutterForegroundTask.isRunningService){
+      await FlutterForegroundTask.startService(serviceId:258,notificationTitle:'Crypto Signal Lab',notificationText:'پایش معاملات پیپر هر ۱۵ ثانیه',callback:startPaperMonitorCallback);
+    }
+    await p.setString('paperMonitorOwner','background');
+  }
+  Future<void> _stopBackgroundMonitor() async {
+    final p=await SharedPreferences.getInstance();
+    await p.setString('paperMonitorOwner','foreground');
+    if(await FlutterForegroundTask.isRunningService){await FlutterForegroundTask.stopService();}
+  }
+  @override void didChangeAppLifecycleState(AppLifecycleState state){
+    if(state==AppLifecycleState.resumed){
+      _serviceTransition=_serviceTransition.then((_)async{await _stopBackgroundMonitor();if(mounted){await _load();await _autoMonitorTick();}}).catchError((_){});
+    } else if(state==AppLifecycleState.paused){
+      _serviceTransition=_serviceTransition.then((_)=>_startBackgroundMonitor()).catchError((_){});
+    }
+  }
   @override void dispose(){_monitorTimer?.cancel();WidgetsBinding.instance.removeObserver(this);super.dispose();}
   Future<void> _initNotifications() async {try{const settings=InitializationSettings(android:AndroidInitializationSettings('@mipmap/ic_launcher'));await notifications.initialize(settings);await notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();}catch(_){}}
   Future<void> _notifySignal(Signal s) async {try{await notifications.show(100,'سیگنال ${s.side} • ${s.symbol}','ورود ${fmt(s.entry)} | SL ${fmt(s.sl)} | TP ${fmt(s.tp1)}',const NotificationDetails(android:AndroidNotificationDetails('crypto_signals','Crypto Signals',channelDescription:'Signal alerts',importance:Importance.high,priority:Priority.high)));}catch(_){}}
@@ -249,14 +292,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try{
       for(final sym in watch){
         try{
-          final candles=await MarketApi.candles(sym,'5m',limit:3);
-          if(candles.isEmpty)throw Exception('کندل خالی');
-          final c=candles.last; if(!c.close.isFinite||c.close<=0)throw Exception('قیمت نامعتبر');
-          // Historical signals: use candle extremes so intrabar TP/SL touches are not missed.
+          final price=await MarketApi.lastPrice(sym);
+          if(!price.isFinite||price<=0)throw Exception('قیمت نامعتبر');
+          // Live price checks: TP/SL are evaluated against the latest traded price.
           for(var i=0;i<history.length;i++){
             final h=history[i]; if(h.symbol!=sym||h.outcome!='PENDING'||h.side=='WAIT')continue;
-            final hitSl=h.side=='LONG'?c.low<=h.sl:c.high>=h.sl;
-            final hitTp=h.side=='LONG'?c.high>=h.tp1:c.low<=h.tp1;
+            final hitSl=h.side=='LONG'?price<=h.sl:price>=h.sl;
+            final hitTp=h.side=='LONG'?price>=h.tp1:price<=h.tp1;
             if(hitSl||hitTp){
               final outcome=hitSl?'SL':'TP1';
               history[i]=Signal(symbol:h.symbol,interval:h.interval,side:h.side,reason:h.reason,time:h.time,entry:h.entry,sl:h.sl,tp1:h.tp1,tp2:h.tp2,rsi:h.rsi,atr:h.atr,probability:h.probability,score:h.score,outcome:outcome);
@@ -264,15 +306,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               await _notifyOutcome(h,outcome);
             }
           }
-          // Paper positions: conservative SL priority if both levels are touched in one candle.
+          // Paper positions are closed when the latest live price reaches a level.
           for(var i=0;i<trades.length;i++){
             final t=trades[i]; if(t.symbol!=sym||t.status!='OPEN')continue;
-            final hitSl=t.side=='LONG'?c.low<=t.sl:c.high>=t.sl;
-            final hitTp=t.side=='LONG'?c.high>=t.tp1:c.low<=t.tp1;
-            final closed=hitSl||hitTp; final exit=closed?(hitSl?t.sl:t.tp1):c.close;
+            final hitSl=t.side=='LONG'?price<=t.sl:price>=t.sl;
+            final hitTp=t.side=='LONG'?price>=t.tp1:price<=t.tp1;
+            final closed=hitSl||hitTp; final exit=price;
             final gross=(t.side=='LONG'?exit-t.entry:t.entry-exit)*t.qty;
             final exitFee=closed?exit*t.qty*_paperFeeRate:0.0;
-            final net=closed?gross-t.entryFee-exitFee:(t.side=='LONG'?c.close-t.entry:t.entry-c.close)*t.qty-t.entryFee;
+            final net=gross-t.entryFee-exitFee;
             trades[i]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:net,margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
             if(closed){paperBalance+=gross-exitFee;await _notifyTradeClose(t,hitSl?'SL':'TP');}
             changed=true;
@@ -378,56 +420,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('معامله مجازی با اهرم ${maxLeverage.toStringAsFixed(0)}x ثبت شد؛ مارجین ${margin.toStringAsFixed(2)} و کارمزد ورود ${entryFee.toStringAsFixed(4)} USDT. سفارش واقعی ارسال نمی‌شود.')));
   }
   Future<void> _refreshPaper() async {
-    final open=trades.where((x)=>x.status=='OPEN').toList();
-    if(open.isEmpty){
-      if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ بازی برای بررسی وجود ندارد.')));
-      return;
-    }
-    int updated=0, failed=0;
-    final failures=<String>[];
-    for(final t in open){
-      try{
-        final candles=await MarketApi.candles(t.symbol,'5m',limit:3);
-        if(candles.isEmpty) throw Exception('داده کندل خالی است');
-        final candle=candles.last;
-        final price=candle.close;
-        if(!price.isFinite||price<=0) throw Exception('قیمت دریافتی نامعتبر است');
-        // اگر SL و TP در یک کندل لمس شوند، برای جلوگیری از خوش‌بینی، SL اولویت دارد.
-        final hitSl=t.side=='LONG'?candle.low<=t.sl:candle.high>=t.sl;
-        final hitTp=t.side=='LONG'?candle.high>=t.tp1:candle.low<=t.tp1;
-        final closed=hitSl||hitTp;
-        final exitPrice=closed?(hitSl?t.sl:t.tp1):price;
-        final grossPnl=(t.side=='LONG'?exitPrice-t.entry:t.entry-exitPrice)*t.qty;
-        final exitFee=exitPrice*t.qty*_paperFeeRate;
-        // Entry fee was deducted at opening; include both fees in displayed net PnL.
-        final netPnl=grossPnl-t.entryFee-exitFee;
-        final idx=trades.indexWhere((x)=>x.id==t.id);
-        if(idx<0) continue;
-        trades[idx]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',
-          opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:netPnl,
-          margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
-        if(closed){
-          // Release margin by removing OPEN status; realize gross PnL less exit fee.
-          // Entry fee was already deducted from paperBalance at entry.
-          paperBalance+=grossPnl-exitFee;
-        }
-        updated++;
-      }catch(e){
-        failed++;
-        failures.add('${t.symbol}: $e');
-      }
-    }
-    if(mounted){
-      setState((){});
-      final message=updated>0
-        ? 'قیمت $updated معامله به‌روزرسانی شد${failed>0?'؛ خطای دریافت برای $failed معامله':''}.'
-        : 'به‌روزرسانی انجام نشد؛ دریافت قیمت ناموفق بود.';
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text(message),duration:const Duration(seconds:5)));
-      if(failed>0){
-        setState(()=>error='خطای به‌روزرسانی Paper:\n${failures.join('\n')}');
-      }
-    }
-    if(updated>0) await _save();
+    await _autoMonitorTick();
+    if(!mounted)return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('قیمت لحظه‌ای و وضعیت معاملات بررسی شد.')));
   }
   Future<void> _backtest() async {
     setState(() { loading=true; error=''; });
@@ -516,7 +511,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
     Text('موجودی آزاد: ${_availablePaperBalance.toStringAsFixed(2)} USDT • مارجین رزروشده: ${_reservedPaperMargin.toStringAsFixed(2)} USDT',style:const TextStyle(color:Colors.white70)),
     const SizedBox(height:6),
-    const Text('پایش خودکار هر ۱۵ ثانیه هنگام باز و فعال بودن برنامه؛ در پس‌زمینه/پس از بسته‌شدن تضمین‌شده نیست.',style:TextStyle(color:Colors.greenAccent)),
+    const Text('به‌روزرسانی قیمت هر ۱۵ ثانیه؛ در پس‌زمینه با اعلان دائمی ادامه می‌یابد.',style:TextStyle(color:Colors.greenAccent)),
     if(_lastMonitorAt!=null)Text('آخرین بررسی: ${_lastMonitorAt!.toLocal()}',style:const TextStyle(color:Colors.white54)),
     const SizedBox(height:10),
     Row(children:[const Text('ریسک هر معامله'),Expanded(child:Slider(value:riskPercent,min:0.25,max:3,divisions:11,label:'${riskPercent.toStringAsFixed(2)}%',onChanged:(v)=>setState(()=>riskPercent=v))),Text('${riskPercent.toStringAsFixed(2)}%')]),
