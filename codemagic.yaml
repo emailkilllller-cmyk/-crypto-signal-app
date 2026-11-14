@@ -67,6 +67,34 @@ workflows:
           print('Internet permission checked')
           PY
 
+      - name: Add foreground monitoring permissions
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          permissions = [
+              'android.permission.FOREGROUND_SERVICE',
+              'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
+              'android.permission.WAKE_LOCK',
+              'android.permission.POST_NOTIFICATIONS',
+          ]
+          m = re.search(r'<manifest\b[^>]*>', s)
+          if not m:
+              raise SystemExit('ERROR: manifest opening tag not found')
+          missing = [name for name in permissions if name not in s]
+          if missing:
+              block = ''.join(
+                  f'\n    <uses-permission android:name="{name}" />'
+                  for name in missing
+              )
+              s = s[:m.end()] + block + s[m.end():]
+              p.write_text(s)
+          print('Foreground monitoring permissions checked')
+          PY
+
       - name: Enable Android desugaring
         script: |
           python3 - <<'PY'
