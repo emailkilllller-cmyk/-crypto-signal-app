@@ -99,7 +99,7 @@ class PaperMonitorTaskHandler extends TaskHandler {
   }
 
   @override
-  Future<void> onDestroy(DateTime timestamp) async {
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
     // stopService must not return while this isolate is still writing SharedPreferences.
     final activeTick = _activeTick;
     if (activeTick != null) await activeTick;
