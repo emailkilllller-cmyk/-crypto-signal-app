@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -6,14 +5,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_foreground_task/flutter_foreground_task.dart';
-import 'paper_monitor_service.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  FlutterForegroundTask.initCommunicationPort();
-  runApp(const CryptoSignalApp());
-}
+void main() => runApp(const CryptoSignalApp());
 
 class CryptoSignalApp extends StatelessWidget {
   const CryptoSignalApp({super.key});
@@ -52,26 +45,6 @@ class Signal {
     sl:(j['sl'] as num).toDouble(), tp1:(j['tp1'] as num).toDouble(), tp2:(j['tp2'] as num).toDouble(),
     rsi:(j['rsi'] as num).toDouble(), atr:(j['atr'] as num).toDouble(),
     probability:(j['probability'] as num).toDouble(), score:(j['score'] as num).toInt(), outcome:j['outcome'] ?? 'PENDING');
-}
-
-
-class NoEntryRecord {
-  final String symbol, interval;
-  final DateTime time;
-  final double entry, probability;
-  final int score;
-  final List<String> reasons;
-  NoEntryRecord({required this.symbol,required this.interval,required this.time,
-    required this.entry,required this.probability,required this.score,required this.reasons});
-  Map<String,dynamic> toJson()=>{'symbol':symbol,'interval':interval,'time':time.toIso8601String(),
-    'entry':entry,'probability':probability,'score':score,'reasons':reasons};
-  factory NoEntryRecord.fromJson(Map<String,dynamic> j)=>NoEntryRecord(
-    symbol:j['symbol']??'',interval:j['interval']??'',
-    time:DateTime.tryParse(j['time']??'')??DateTime.now(),
-    entry:(j['entry'] as num?)?.toDouble()??0,
-    probability:(j['probability'] as num?)?.toDouble()??0.5,
-    score:(j['score'] as num?)?.toInt()??0,
-    reasons:(j['reasons'] as List? ?? const []).map((e)=>e.toString()).toList());
 }
 
 class PaperTrade {
@@ -117,20 +90,6 @@ class MarketApi {
     final j=jsonDecode(r.body); final rows=j['data'];
     if(j['code']!='0'||rows is! List||rows.length<math.min(limit,30)) throw Exception('No candles / API ${j['msg']}');
     return rows.map<Candle>((e)=>Candle(int.parse('${e[0]}'),double.parse('${e[1]}'),double.parse('${e[2]}'),double.parse('${e[3]}'),double.parse('${e[4]}'),double.parse('${e[5]}'))).toList().reversed.toList();
-  }
-  static Future<double> lastPrice(String symbol) async {
-    final pair=symbol.replaceAll('-','');
-    try {
-      final r=await http.get(Uri.https('fapi.binance.com','/fapi/v1/ticker/price',{'symbol':pair})).timeout(const Duration(seconds:10));
-      if(r.statusCode==200){final v=double.tryParse('${jsonDecode(r.body)['price']}');if(v!=null&&v>0)return v;}
-    } catch (_) {}
-    final r=await http.get(Uri.https('www.okx.com','/api/v5/market/ticker',{'instId':'$symbol-SWAP'})).timeout(const Duration(seconds:10));
-    if(r.statusCode!=200)throw Exception('خطای دریافت قیمت: HTTP ${r.statusCode}');
-    final j=jsonDecode(r.body);final data=j['data'];
-    if(j['code']!='0'||data is! List||data.isEmpty)throw Exception('قیمت لحظه‌ای OKX در دسترس نیست');
-    final v=double.tryParse('${data.first['last']}');
-    if(v==null||v<=0)throw Exception('قیمت دریافتی نامعتبر است');
-    return v;
   }
 }
 
@@ -249,120 +208,15 @@ class MLModel {
 }
 
 class HomePage extends StatefulWidget {const HomePage({super.key});@override State<HomePage> createState()=>_HomePageState();}
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
-  Timer? _monitorTimer; bool _monitorBusy=false; Completer<void>? _monitorCompletion; DateTime? _lastMonitorAt; Future<void> _serviceTransition=Future<void>.value();
-  final MLModel model=MLModel(); final FlutterLocalNotificationsPlugin notifications=FlutterLocalNotificationsPlugin(); int tab=0; String symbol='BTC-USDT',tf='1h'; bool loading=false; String error=''; List<String> symbols=['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','LINK-USDT','AVAX-USDT']; Signal? current; List<Signal> history=[]; List<NoEntryRecord> noEntryHistory=[]; List<PaperTrade> trades=[]; double paperBalance=10000; double riskPercent=1; double maxLeverage=5; bool autoLeverage=true; int mtfScore=0; String mtfSummary='';
-  @override void initState(){super.initState();WidgetsBinding.instance.addObserver(this);_initForegroundService();_load().then((_)=>_autoMonitorTick());_loadSymbols();model.load();_initNotifications();_monitorTimer=Timer.periodic(const Duration(seconds:15),(_)=>_autoMonitorTick());}
-  Future<void> _initForegroundService() async {
-    FlutterForegroundTask.init(androidNotificationOptions:AndroidNotificationOptions(channelId:'paper_monitor',channelName:'Paper trade monitoring',channelDescription:'Monitors open paper trades every 15 seconds',onlyAlertOnce:true),iosNotificationOptions:const IOSNotificationOptions(showNotification:false,playSound:false),foregroundTaskOptions:ForegroundTaskOptions(eventAction:ForegroundTaskEventAction.repeat(15000),allowWakeLock:true,allowWifiLock:true,allowAutoRestart:true));
-    try { await FlutterForegroundTask.requestNotificationPermission(); } catch (_) {}
-  }
-  Future<void> _startBackgroundMonitor() async {
-    // Do not hand storage ownership to the service while a foreground tick is active.
-    final activeTick = _monitorCompletion;
-    if (activeTick != null) await activeTick.future;
-    final p=await SharedPreferences.getInstance();
-    await p.setString('paperMonitorOwner','transition');
-    if(!await FlutterForegroundTask.isRunningService){
-      await FlutterForegroundTask.startService(serviceId:258,notificationTitle:'Crypto Signal Lab',notificationText:'پایش معاملات پیپر هر ۱۵ ثانیه',callback:startPaperMonitorCallback);
-    }
-    await p.setString('paperMonitorOwner','background');
-  }
-  Future<void> _stopBackgroundMonitor() async {
-    final p=await SharedPreferences.getInstance();
-    // Block new background writes first, then wait for the service to finish any
-    // tick already in progress before the foreground reads or writes paper data.
-    await p.setString('paperMonitorOwner','transition');
-    if(await FlutterForegroundTask.isRunningService){await FlutterForegroundTask.stopService();}
-    await p.setString('paperMonitorOwner','foreground');
-  }
-  @override void didChangeAppLifecycleState(AppLifecycleState state){
-    if(state==AppLifecycleState.resumed){
-      _serviceTransition=_serviceTransition.then((_)async{await _stopBackgroundMonitor();if(mounted){await _load();await _autoMonitorTick();}}).catchError((_){});
-    } else if(state==AppLifecycleState.paused){
-      _serviceTransition=_serviceTransition.then((_)=>_startBackgroundMonitor()).catchError((_){});
-    }
-  }
-  @override void dispose(){_monitorTimer?.cancel();WidgetsBinding.instance.removeObserver(this);super.dispose();}
+class _HomePageState extends State<HomePage> {
+  final MLModel model=MLModel(); final FlutterLocalNotificationsPlugin notifications=FlutterLocalNotificationsPlugin(); int tab=0; String symbol='BTC-USDT',tf='1h'; bool loading=false; String error=''; List<String> symbols=['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','LINK-USDT','AVAX-USDT']; Signal? current; List<Signal> history=[]; List<PaperTrade> trades=[]; double paperBalance=10000; double riskPercent=1; double maxLeverage=5; bool autoLeverage=true; int mtfScore=0; String mtfSummary='';
+  @override void initState(){super.initState();_load();_loadSymbols();model.load();_initNotifications();}
   Future<void> _initNotifications() async {try{const settings=InitializationSettings(android:AndroidInitializationSettings('@mipmap/ic_launcher'));await notifications.initialize(settings);await notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();}catch(_){}}
   Future<void> _notifySignal(Signal s) async {try{await notifications.show(100,'سیگنال ${s.side} • ${s.symbol}','ورود ${fmt(s.entry)} | SL ${fmt(s.sl)} | TP ${fmt(s.tp1)}',const NotificationDetails(android:AndroidNotificationDetails('crypto_signals','Crypto Signals',channelDescription:'Signal alerts',importance:Importance.high,priority:Priority.high)));}catch(_){}}
-  Future<void> _load() async {final p=await SharedPreferences.getInstance();setState((){history=(jsonDecode(p.getString('history')??'[]') as List).map((e)=>Signal.fromJson(e)).toList();noEntryHistory=(jsonDecode(p.getString('noEntryHistory')??'[]') as List).map((e)=>NoEntryRecord.fromJson(Map<String,dynamic>.from(e))).toList();trades=(jsonDecode(p.getString('paperTrades')??'[]') as List).map((e)=>PaperTrade.fromJson(e)).toList();paperBalance=p.getDouble('paperBalance')??10000;});}
-  Future<void> _save() async {final p=await SharedPreferences.getInstance();await p.setString('history',jsonEncode(history.map((x)=>x.toJson()).toList()));await p.setString('noEntryHistory',jsonEncode(noEntryHistory.map((x)=>x.toJson()).toList()));await p.setString('paperTrades',jsonEncode(trades.map((x)=>x.toJson()).toList()));await p.setDouble('paperBalance',paperBalance);}
-  Future<void> _autoMonitorTick() async {
-    if(!mounted||_monitorBusy||WidgetsBinding.instance.lifecycleState!=AppLifecycleState.resumed)return;
-    final pending=history.where((h)=>h.outcome=='PENDING'&&h.side!='WAIT').map((h)=>h.symbol);
-    final open=trades.where((t)=>t.status=='OPEN').map((t)=>t.symbol);
-    final watch=<String>{...pending,...open};
-    if(watch.isEmpty)return;
-    _monitorBusy=true; _monitorCompletion=Completer<void>(); bool changed=false; final failures=<String>[];
-    try{
-      for(final sym in watch){
-        try{
-          final price=await MarketApi.lastPrice(sym);
-          if(!price.isFinite||price<=0)throw Exception('قیمت نامعتبر');
-          // Live price checks: TP/SL are evaluated against the latest traded price.
-          for(var i=0;i<history.length;i++){
-            final h=history[i]; if(h.symbol!=sym||h.outcome!='PENDING'||h.side=='WAIT')continue;
-            final hitSl=h.side=='LONG'?price<=h.sl:price>=h.sl;
-            final hitTp=h.side=='LONG'?price>=h.tp1:price<=h.tp1;
-            if(hitSl||hitTp){
-              final outcome=hitSl?'SL':'TP1';
-              history[i]=Signal(symbol:h.symbol,interval:h.interval,side:h.side,reason:h.reason,time:h.time,entry:h.entry,sl:h.sl,tp1:h.tp1,tp2:h.tp2,rsi:h.rsi,atr:h.atr,probability:h.probability,score:h.score,outcome:outcome);
-              changed=true;
-              await _notifyOutcome(h,outcome);
-            }
-          }
-          // Paper positions are closed when the latest live price reaches a level.
-          for(var i=0;i<trades.length;i++){
-            final t=trades[i]; if(t.symbol!=sym||t.status!='OPEN')continue;
-            final hitSl=t.side=='LONG'?price<=t.sl:price>=t.sl;
-            final hitTp=t.side=='LONG'?price>=t.tp1:price<=t.tp1;
-            final closed=hitSl||hitTp; final exit=price;
-            final gross=(t.side=='LONG'?exit-t.entry:t.entry-exit)*t.qty;
-            final exitFee=closed?exit*t.qty*_paperFeeRate:0.0;
-            final net=gross-t.entryFee-exitFee;
-            trades[i]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:net,margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
-            if(closed){paperBalance+=gross-exitFee;await _notifyTradeClose(t,hitSl?'SL':'TP');}
-            changed=true;
-          }
-        }catch(e){failures.add('$sym: $e');}
-      }
-      if(changed){await _save();if(mounted)setState(()=>_lastMonitorAt=DateTime.now());}
-      else if(mounted)setState(()=>_lastMonitorAt=DateTime.now());
-      if(failures.isNotEmpty&&mounted)setState(()=>error='خطای پایش خودکار (داده تازه دریافت نشد):\n${failures.join('\n')}');
-    }finally{
-      _monitorBusy=false;
-      final completion=_monitorCompletion;
-      _monitorCompletion=null;
-      if(completion!=null&&!completion.isCompleted)completion.complete();
-    }
-  }
-  Future<void> _notifyOutcome(Signal s,String outcome) async {try{await notifications.show(200+s.time.millisecondsSinceEpoch.remainder(100000),'نتیجه سیگنال ${s.symbol}','$outcome • ورود ${fmt(s.entry)}',const NotificationDetails(android:AndroidNotificationDetails('signal_results','Signal Results',channelDescription:'Signal TP/SL results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
-  Future<void> _notifyTradeClose(PaperTrade t,String outcome) async {try{await notifications.show(300+t.id.hashCode.abs().remainder(100000),'معامله مجازی ${t.symbol} بسته شد','$outcome • نتیجه ${t.pnl.toStringAsFixed(2)} USDT',const NotificationDetails(android:AndroidNotificationDetails('paper_results','Paper Results',channelDescription:'Paper trade results',importance:Importance.high,priority:Priority.high)));}catch(_) {}}
+  Future<void> _load() async {final p=await SharedPreferences.getInstance();setState((){history=(jsonDecode(p.getString('history')??'[]') as List).map((e)=>Signal.fromJson(e)).toList();trades=(jsonDecode(p.getString('paperTrades')??'[]') as List).map((e)=>PaperTrade.fromJson(e)).toList();paperBalance=p.getDouble('paperBalance')??10000;});}
+  Future<void> _save() async {final p=await SharedPreferences.getInstance();await p.setString('history',jsonEncode(history.map((x)=>x.toJson()).toList()));await p.setString('paperTrades',jsonEncode(trades.map((x)=>x.toJson()).toList()));await p.setDouble('paperBalance',paperBalance);}
   Future<void> _loadSymbols() async {try{final list=await MarketApi.symbols();if(mounted)setState(()=>symbols=list);}catch(_) {}}
   String fmt(double n)=>n.abs()>=100?n.toStringAsFixed(2):n.toStringAsFixed(5);
-  List<String> _noEntryReasons({required Signal raw,required String filteredSide,
-    required double macd,required int ichi,required int mtfTotal}) {
-    final reasons=<String>[];
-    if(raw.side=='WAIT') {
-      if(model.trained && raw.probability>0.42 && raw.probability<0.58) {
-        reasons.add('احتمال ML به حد ورود نرسید (بازه خنثی ۴۲٪ تا ۵۸٪)');
-      } else {
-        reasons.add('امتیاز/جهت اولیه الگوریتم برای ورود کافی نبود');
-      }
-    } else {
-      if(raw.side=='LONG' && macd<=0) reasons.add('MACD با ورود خرید هم‌جهت نبود');
-      if(raw.side=='SHORT' && macd>=0) reasons.add('MACD با ورود فروش هم‌جهت نبود');
-      if(raw.side=='LONG' && ichi<0) reasons.add('Ichimoku با ورود خرید مخالفت داشت');
-      if(raw.side=='SHORT' && ichi>0) reasons.add('Ichimoku با ورود فروش مخالفت داشت');
-      if(raw.side=='LONG' && mtfTotal<=-2) reasons.add('روند تایم‌فریم‌های چندگانه مخالف خرید بود');
-      if(raw.side=='SHORT' && mtfTotal>=2) reasons.add('روند تایم‌فریم‌های چندگانه مخالف فروش بود');
-    }
-    if(reasons.isEmpty && filteredSide=='WAIT') reasons.add('یکی از فیلترهای ترکیبی ورود را رد کرد');
-    if(reasons.isEmpty) reasons.add('شرایط ورود کامل نبود');
-    return reasons;
-  }
-
   Future<void> _analyze() async {setState(() { loading=true; error=''; });try{
     await model.load(); final cs=await MarketApi.candles(symbol,tf); final prob=model.predict(Indicators.features(cs));
     // Multi-timeframe confirmation: 15m, 1h, 4h. The selected timeframe remains the signal's main frame.
@@ -378,21 +232,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         (raw.side=='SHORT' && total>=2)) {
       side='WAIT';
     }
-    final noEntryReasons=side=='WAIT'
-        ? _noEntryReasons(raw:raw,filteredSide:side,macd:macd,ichi:ichi,mtfTotal:total)
-        : <String>[];
     final risk=math.max(raw.atr*1.6,raw.entry*0.003).toDouble(); final sl=side=='LONG'?raw.entry-risk:side=='SHORT'?raw.entry+risk:raw.entry;
     final tp1=side=='LONG'?raw.entry+risk*1.5:side=='SHORT'?raw.entry-risk*1.5:raw.entry; final tp2=side=='LONG'?raw.entry+risk*2.5:side=='SHORT'?raw.entry-risk*2.5:raw.entry;
     final s=Signal(symbol:raw.symbol,interval:raw.interval,side:side,reason:'${raw.reason} • MTF: $mtfSummary • Ichimoku: ${ichi>0?'صعودی':ichi<0?'نزولی':'خنثی'} ($ichi) • MACD: ${macd>0?'صعودی':'نزولی'}',time:raw.time,entry:raw.entry,sl:sl,tp1:tp1,tp2:tp2,rsi:raw.rsi,atr:raw.atr,probability:raw.probability,score:raw.score+total+ichi);
-    setState(()=>current=s); _evaluateHistory(symbol,raw.entry);
-    if(s.side!='WAIT'){
-      await _notifySignal(s);history.insert(0,s);if(history.length>500)history.removeLast();await _save();
-    } else {
-      noEntryHistory.insert(0,NoEntryRecord(symbol:symbol,interval:tf,time:raw.time,
-        entry:raw.entry,probability:raw.probability,score:s.score,reasons:noEntryReasons));
-      if(noEntryHistory.length>500)noEntryHistory.removeLast();
-      await _save();
-    }
+    setState(()=>current=s); _evaluateHistory(symbol,raw.entry); if(s.side!='WAIT'){await _notifySignal(s);history.insert(0,s);if(history.length>500)history.removeLast();await _save();}
   }catch(e){setState(()=>error='دریافت داده ناموفق بود؛ ممکن است DNS یا دسترسی منطقه‌ای محدود باشد.\n$e');}finally{if(mounted)setState(()=>loading=false);}}
   void _evaluateHistory(String sym,double price){
     bool changed=false; for(int i=0;i<history.length;i++){final h=history[i];if(h.symbol!=sym||h.outcome!='PENDING'||h.side=='WAIT')continue;String result='PENDING';
@@ -431,9 +274,56 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text('معامله مجازی با اهرم ${maxLeverage.toStringAsFixed(0)}x ثبت شد؛ مارجین ${margin.toStringAsFixed(2)} و کارمزد ورود ${entryFee.toStringAsFixed(4)} USDT. سفارش واقعی ارسال نمی‌شود.')));
   }
   Future<void> _refreshPaper() async {
-    await _autoMonitorTick();
-    if(!mounted)return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('قیمت لحظه‌ای و وضعیت معاملات بررسی شد.')));
+    final open=trades.where((x)=>x.status=='OPEN').toList();
+    if(open.isEmpty){
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('معاملهٔ بازی برای بررسی وجود ندارد.')));
+      return;
+    }
+    int updated=0, failed=0;
+    final failures=<String>[];
+    for(final t in open){
+      try{
+        final candles=await MarketApi.candles(t.symbol,'5m',limit:3);
+        if(candles.isEmpty) throw Exception('داده کندل خالی است');
+        final candle=candles.last;
+        final price=candle.close;
+        if(!price.isFinite||price<=0) throw Exception('قیمت دریافتی نامعتبر است');
+        // اگر SL و TP در یک کندل لمس شوند، برای جلوگیری از خوش‌بینی، SL اولویت دارد.
+        final hitSl=t.side=='LONG'?candle.low<=t.sl:candle.high>=t.sl;
+        final hitTp=t.side=='LONG'?candle.high>=t.tp1:candle.low<=t.tp1;
+        final closed=hitSl||hitTp;
+        final exitPrice=closed?(hitSl?t.sl:t.tp1):price;
+        final grossPnl=(t.side=='LONG'?exitPrice-t.entry:t.entry-exitPrice)*t.qty;
+        final exitFee=exitPrice*t.qty*_paperFeeRate;
+        // Entry fee was deducted at opening; include both fees in displayed net PnL.
+        final netPnl=grossPnl-t.entryFee-exitFee;
+        final idx=trades.indexWhere((x)=>x.id==t.id);
+        if(idx<0) continue;
+        trades[idx]=PaperTrade(id:t.id,symbol:t.symbol,side:t.side,status:closed?(hitSl?'SL':'TP'):'OPEN',
+          opened:t.opened,entry:t.entry,sl:t.sl,tp1:t.tp1,qty:t.qty,pnl:netPnl,
+          margin:t.margin,entryFee:t.entryFee,leverage:t.leverage);
+        if(closed){
+          // Release margin by removing OPEN status; realize gross PnL less exit fee.
+          // Entry fee was already deducted from paperBalance at entry.
+          paperBalance+=grossPnl-exitFee;
+        }
+        updated++;
+      }catch(e){
+        failed++;
+        failures.add('${t.symbol}: $e');
+      }
+    }
+    if(mounted){
+      setState((){});
+      final message=updated>0
+        ? 'قیمت $updated معامله به‌روزرسانی شد${failed>0?'؛ خطای دریافت برای $failed معامله':''}.'
+        : 'به‌روزرسانی انجام نشد؛ دریافت قیمت ناموفق بود.';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content:Text(message),duration:const Duration(seconds:5)));
+      if(failed>0){
+        setState(()=>error='خطای به‌روزرسانی Paper:\n${failures.join('\n')}');
+      }
+    }
+    if(updated>0) await _save();
   }
   Future<void> _backtest() async {
     setState(() { loading=true; error=''; });
@@ -504,26 +394,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
   @override Widget build(BuildContext context)=>Scaffold(appBar:AppBar(title:const Text('سیگنال‌یار کریپتو'),centerTitle:true,actions:[IconButton(onPressed:_loadSymbols,icon:const Icon(Icons.refresh),tooltip:'به‌روزرسانی فهرست ارزها')]),body:IndexedStack(index:tab,children:[_analysisView(),_paperView(),_historyView()]),bottomNavigationBar:NavigationBar(selectedIndex:tab,onDestinationSelected:(i)=>setState(()=>tab=i),destinations:const [NavigationDestination(icon:Icon(Icons.insights),label:'تحلیل'),NavigationDestination(icon:Icon(Icons.account_balance_wallet),label:'Paper'),NavigationDestination(icon:Icon(Icons.history),label:'تاریخچه') ]));
-  Widget _noEntrySummary()=>Card(
-    color:const Color(0xFF202936),
-    child:Padding(padding:const EdgeInsets.all(12),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[
-      Text('گزارش عدم ورود: ${noEntryHistory.length} مورد',style:const TextStyle(fontWeight:FontWeight.bold)),
-      if(noEntryHistory.isEmpty) const Text('هنوز تحلیل عدم ورودی ثبت نشده است.',style:TextStyle(color:Colors.white70))
-      else ...[
-        Text('آخرین مورد: ${noEntryHistory.first.symbol} • ${noEntryHistory.first.interval} • ${noEntryHistory.first.time.toLocal()}',
-          style:const TextStyle(color:Colors.white70)),
-        ...noEntryHistory.first.reasons.map((r)=>Text('• $r',style:const TextStyle(color:Colors.orangeAccent))),
-      ],
-    ])));
-  Widget _analysisView()=>ListView(padding:const EdgeInsets.all(16),children:[const Text('فیوچرز • داده عمومی • بدون اتصال حساب صرافی',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:16),Row(children:[Expanded(child:DropdownButtonFormField<String>(value:symbol,decoration:const InputDecoration(labelText:'ارز / قرارداد',border:OutlineInputBorder()),items:symbols.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>symbol=v??symbol))),const SizedBox(width:10),Expanded(child:DropdownButtonFormField<String>(value:tf,decoration:const InputDecoration(labelText:'تایم‌فریم',border:OutlineInputBorder()),items:MarketApi.intervals.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>tf=v??tf))) ]),const SizedBox(height:12),FilledButton.icon(onPressed:loading?null:_analyze,icon:loading?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.analytics),label:Text(loading?'در حال بررسی...':'تحلیل و دریافت سیگنال')),if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),if(current!=null)_signalCard(current!),_noEntrySummary(),const SizedBox(height:10),OutlinedButton.icon(onPressed:loading?null:_backtest,icon:const Icon(Icons.science),label:const Text('اجرای بک‌تست (تا ۵۰۰ کندل)')),const SizedBox(height:14),const Card(child:Padding(padding:EdgeInsets.all(12),child:Text('⚠️ این اپ پژوهشی است. مدل ML فقط پس از آموزش و جایگزینی فایل model_weights.json فعال می‌شود. بک‌تست از ML Ensemble استفاده می‌کند؛ کارمزد و اسلیپیج تقریبی‌اند و funding کامل مدل نشده است. فقط حساب مجازی؛ هیچ سفارش واقعی ارسال نمی‌شود.',textDirection:TextDirection.rtl,style:TextStyle(height:1.5))))]);
+  Widget _analysisView()=>ListView(padding:const EdgeInsets.all(16),children:[const Text('فیوچرز • داده عمومی • بدون اتصال حساب صرافی',textAlign:TextAlign.center,style:TextStyle(color:Colors.white70)),const SizedBox(height:16),Row(children:[Expanded(child:DropdownButtonFormField<String>(value:symbol,decoration:const InputDecoration(labelText:'ارز / قرارداد',border:OutlineInputBorder()),items:symbols.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>symbol=v??symbol))),const SizedBox(width:10),Expanded(child:DropdownButtonFormField<String>(value:tf,decoration:const InputDecoration(labelText:'تایم‌فریم',border:OutlineInputBorder()),items:MarketApi.intervals.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),onChanged:(v)=>setState(()=>tf=v??tf))) ]),const SizedBox(height:12),FilledButton.icon(onPressed:loading?null:_analyze,icon:loading?const SizedBox(width:18,height:18,child:CircularProgressIndicator(strokeWidth:2)):const Icon(Icons.analytics),label:Text(loading?'در حال بررسی...':'تحلیل و دریافت سیگنال')),if(error.isNotEmpty)Padding(padding:const EdgeInsets.only(top:12),child:Text(error,style:const TextStyle(color:Colors.orangeAccent))),if(current!=null)_signalCard(current!),const SizedBox(height:10),OutlinedButton.icon(onPressed:loading?null:_backtest,icon:const Icon(Icons.science),label:const Text('اجرای بک‌تست (تا ۵۰۰ کندل)')),const SizedBox(height:14),const Card(child:Padding(padding:EdgeInsets.all(12),child:Text('⚠️ این اپ پژوهشی است. مدل ML فقط پس از آموزش و جایگزینی فایل model_weights.json فعال می‌شود. بک‌تست از ML Ensemble استفاده می‌کند؛ کارمزد و اسلیپیج تقریبی‌اند و funding کامل مدل نشده است. فقط حساب مجازی؛ هیچ سفارش واقعی ارسال نمی‌شود.',textDirection:TextDirection.rtl,style:TextStyle(height:1.5))))]);
   Widget _signalCard(Signal s)=>Card(color:const Color(0xFF1B2330),child:Padding(padding:const EdgeInsets.all(16),child:Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[Text('${s.symbol} • ${s.interval}',textAlign:TextAlign.center),const SizedBox(height:8),Text(s.side=='LONG'?'LONG / خرید':s.side=='SHORT'?'SHORT / فروش':'WAIT / عدم ورود',textAlign:TextAlign.center,style:TextStyle(fontSize:24,fontWeight:FontWeight.bold,color:s.side=='LONG'?Colors.greenAccent:s.side=='SHORT'?Colors.redAccent:Colors.amber)),Text('تایید تایم‌فریم‌ها: $mtfSummary',textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),Text('امتیاز ${s.score} • ${model.trained?'احتمال مدل ML':'امتیاز تخمینی الگوریتم'} ${(s.probability*100).toStringAsFixed(0)}٪',textAlign:TextAlign.center),const Divider(height:24),_row('ورود',fmt(s.entry)),_row('حد ضرر',s.side=='WAIT'?'—':fmt(s.sl)),_row('حد سود ۱',s.side=='WAIT'?'—':fmt(s.tp1)),_row('حد سود ۲',s.side=='WAIT'?'—':fmt(s.tp2)),Text(s.reason,textAlign:TextAlign.center,style:const TextStyle(color:Colors.white70)),if(s.side!='WAIT')FilledButton(onPressed:_openPaper,child:const Text('ثبت معاملهٔ مجازی'))] )));
   Widget _row(String a,String b)=>Padding(padding:const EdgeInsets.symmetric(vertical:4),child:Row(children:[Expanded(child:Text(a)),Text(b,style:const TextStyle(fontWeight:FontWeight.bold))]));
   Widget _paperView()=>ListView(padding:const EdgeInsets.all(16),children:[
     Text('موجودی مجازی: ${paperBalance.toStringAsFixed(2)} USDT',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold)),
     Text('موجودی آزاد: ${_availablePaperBalance.toStringAsFixed(2)} USDT • مارجین رزروشده: ${_reservedPaperMargin.toStringAsFixed(2)} USDT',style:const TextStyle(color:Colors.white70)),
     const SizedBox(height:6),
-    const Text('به‌روزرسانی قیمت هر ۱۵ ثانیه؛ در پس‌زمینه با اعلان دائمی ادامه می‌یابد.',style:TextStyle(color:Colors.greenAccent)),
-    if(_lastMonitorAt!=null)Text('آخرین بررسی: ${_lastMonitorAt!.toLocal()}',style:const TextStyle(color:Colors.white54)),
+    const Text('سود/ضرر معاملات باز پس از به‌روزرسانی، شناور است و تا بسته‌شدن به موجودی اضافه نمی‌شود.',style:TextStyle(color:Colors.white70)),
     const SizedBox(height:10),
     Row(children:[const Text('ریسک هر معامله'),Expanded(child:Slider(value:riskPercent,min:0.25,max:3,divisions:11,label:'${riskPercent.toStringAsFixed(2)}%',onChanged:(v)=>setState(()=>riskPercent=v))),Text('${riskPercent.toStringAsFixed(2)}%')]),
     Row(children:[const Text('حداکثر اهرم'),Expanded(child:Slider(value:maxLeverage,min:1,max:5,divisions:4,label:'${maxLeverage.toStringAsFixed(0)}x',onChanged:(v)=>setState(()=>maxLeverage=v))),Text('${maxLeverage.toStringAsFixed(0)}x')]),
@@ -537,17 +415,5 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       trailing:Text('${t.pnl.toStringAsFixed(2)} USDT\n${t.status=='OPEN'?'سود/ضرر شناور':'نتیجه نهایی'}',textAlign:TextAlign.end,style:TextStyle(color:t.pnl>=0?Colors.greenAccent:Colors.redAccent)),
     ))),
   ]);
-  Widget _historyView()=>ListView(padding:const EdgeInsets.all(16),children:[
-    Row(children:[const Expanded(child:Text('سیگنال‌های ذخیره‌شده',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold))),TextButton(onPressed:()async{setState(()=>history.clear());await _save();},child:const Text('پاک کردن'))]),
-    if(history.isEmpty)const Text('تاریخچه سیگنال خالی است.'),
-    ...history.map((s)=>Card(child:ListTile(title:Text('${s.symbol} • ${s.side}'),subtitle:Text('${s.interval} | ${s.time.toLocal()} | entry ${fmt(s.entry)} | نتیجه: ${s.outcome}'),trailing:Text('${(s.probability*100).toStringAsFixed(0)}%')))),
-    const Divider(height:28),
-    Row(children:[Expanded(child:Text('عدم ورودها (${noEntryHistory.length})',style:const TextStyle(fontSize:20,fontWeight:FontWeight.bold))),TextButton(onPressed:()async{setState(()=>noEntryHistory.clear());await _save();},child:const Text('پاک کردن'))]),
-    if(noEntryHistory.isEmpty)const Text('هنوز موردی ثبت نشده است.'),
-    ...noEntryHistory.map((r)=>Card(child:ListTile(
-      title:Text('${r.symbol} • ${r.interval} • عدم ورود'),
-      subtitle:Text('${r.time.toLocal()} | قیمت ${fmt(r.entry)} | ML ${(r.probability*100).toStringAsFixed(0)}٪\n${r.reasons.map((x)=>'• $x').join('\n')}'),
-      isThreeLine:true,
-    ))),
-  ]);
+  Widget _historyView()=>ListView(padding:const EdgeInsets.all(16),children:[Row(children:[const Expanded(child:Text('سیگنال‌های ذخیره‌شده',style:TextStyle(fontSize:20,fontWeight:FontWeight.bold))),TextButton(onPressed:()async{setState(()=>history.clear());await _save();},child:const Text('پاک کردن'))]),if(history.isEmpty)const Text('تاریخچه خالی است.'),...history.map((s)=>Card(child:ListTile(title:Text('${s.symbol} • ${s.side}'),subtitle:Text('${s.interval} | ${s.time.toLocal()} | entry ${fmt(s.entry)} | نتیجه: ${s.outcome}'),trailing:Text('${(s.probability*100).toStringAsFixed(0)}%'))))]);
 }
